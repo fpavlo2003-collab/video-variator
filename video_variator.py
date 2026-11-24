@@ -39,7 +39,7 @@ from tkinter import filedialog, messagebox, colorchooser
 
 import customtkinter as ctk
 
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.0.1"
 APP_TITLE = "Video Variator " + ".".join(APP_VERSION.split(".")[:2])
 UPDATE_REPO = "fpavlo2003-collab/video-variator"
 UPDATE_BRANCH = "main"
