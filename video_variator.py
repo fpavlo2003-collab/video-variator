@@ -39,7 +39,7 @@ from tkinter import filedialog, messagebox, colorchooser
 
 import customtkinter as ctk
 
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.2.0"
 APP_TITLE = "Video Variator " + ".".join(APP_VERSION.split(".")[:2])
 UPDATE_REPO = "fpavlo2003-collab/video-variator"
 UPDATE_BRANCH = "main"
@@ -58,6 +58,8 @@ ASPECTS = {"Як в оригіналі": None, "9:16 (Reels / TikTok)": (9, 16),
 WM_TYPES = ["Логотип", "Текст"]
 RANGE_KEYS = ("color_min", "color_max", "bright_min", "bright_max", "hue_max",
               "zoom_min", "zoom_max", "grain_min", "grain_max", "tempo_min", "tempo_max")
+BITRATE_MODES = ["Якість (CRF)", "Фіксований бітрейт"]
+AUDIO_BITRATES = ["128k", "160k", "192k", "256k"]
 HOOK_POSITIONS = ["Зверху", "По центру", "Знизу"]
 HOOK_STYLES = ["Темна плашка", "Біла плашка", "Обводка без плашки"]
 FONT_LIBRARY = [  # (назва, файли-кандидати)
@@ -336,9 +338,21 @@ def encoder_pix_fmt(encoder: str) -> str:
     return "nv12" if encoder in ("h264_qsv", "h264_amf") else "yuv420p"
 
 
-def encoder_args(encoder: str, crf: int, x264_preset: str) -> list[str]:
+def encoder_args(encoder: str, crf: int, x264_preset: str, mbps: float | None = None) -> list[str]:
     q = str(crf)
     pf = encoder_pix_fmt(encoder)
+    if mbps:
+        b = f"{mbps:.2f}M"
+        mx = f"{mbps * 1.5:.2f}M"
+        buf = f"{mbps * 2:.2f}M"
+        rate = ["-b:v", b, "-maxrate", mx, "-bufsize", buf]
+        if encoder == "h264_nvenc":
+            return ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", *rate, "-pix_fmt", pf]
+        if encoder == "h264_qsv":
+            return ["-c:v", "h264_qsv", "-preset", "medium", *rate, "-pix_fmt", pf]
+        if encoder == "h264_amf":
+            return ["-c:v", "h264_amf", "-quality", "balanced", "-rc", "vbr_peak", *rate, "-pix_fmt", pf]
+        return ["-c:v", "libx264", "-preset", x264_preset, *rate, "-pix_fmt", pf]
     if encoder == "h264_nvenc":
         return ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", q,
                 "-b:v", "0", "-pix_fmt", pf]
@@ -396,6 +410,13 @@ class Options:
     grain_max: int = 7
     tempo_min: float = -2.0     # темп, %
     tempo_max: float = 3.0
+    # обрізка та експорт
+    trim_enabled: bool = False
+    trim_start: float = 0.0     # секунд прибрати з початку
+    trim_end: float = 0.0       # секунд прибрати з кінця
+    bitrate_mode: str = "Якість (CRF)"
+    video_mbps: float = 8.0
+    audio_bitrate: str = "192k"
     use_styles: bool = False
     styles: list = field(default_factory=lambda: ["Теплий", "Холодний", "Кіно (teal & orange)"])
     style_strength: float = 0.6
@@ -906,13 +927,28 @@ def build_graph(var: Variation, info: MediaInfo, opt: Options, pix_fmt: str = "y
     return ";".join(parts), extra_inputs, (",".join(af) or None)
 
 
+def trim_window(info: MediaInfo, opt: Options) -> tuple[float, float]:
+    """(початок, тривалість вихідного шматка в секундах вихідника). Без обрізки — (0, повна тривалість)."""
+    if not opt.trim_enabled or info.duration <= 0:
+        return 0.0, info.duration
+    a = max(0.0, float(opt.trim_start))
+    b = max(0.0, float(opt.trim_end))
+    if info.duration - a - b < 0.5:   # щоб не обрізати відео «в нуль»
+        return 0.0, info.duration
+    return a, info.duration - a - b
+
+
 def build_command(ffmpeg: str, src: str, dst: str, var: Variation, info: MediaInfo,
                   opt: Options, assets: dict | None = None) -> list[str]:
     encoder = ENCODERS.get(opt.encoder_label, "libx264")
     fc, extra, af = build_graph(var, info, opt, encoder_pix_fmt(encoder),
                                 tonemap=has_filter(ffmpeg, "zscale"), assets=assets,
                                 has_cas=has_filter(ffmpeg, "cas"))
-    cmd = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-i", src]
+    t0, tlen = trim_window(info, opt)
+    cmd = [ffmpeg, "-hide_banner", "-nostdin", "-y"]
+    if t0 > 0:
+        cmd += ["-ss", f"{t0:.3f}"]
+    cmd += ["-i", src]
     for e in extra:
         cmd += ["-i", e]
     cmd += ["-filter_complex", fc, "-map", "[vout]", "-map", "0:a:0?"]
@@ -921,13 +957,18 @@ def build_command(ffmpeg: str, src: str, dst: str, var: Variation, info: MediaIn
     if var.metadata_stripped:
         cmd += ["-map_metadata", "-1", "-map_chapters", "-1",
                 "-fflags", "+bitexact", "-flags:v", "+bitexact", "-flags:a", "+bitexact"]
-    cmd += encoder_args(encoder, opt.crf, opt.x264_preset)
-    if opt.bitrate_cap:
+    fixed = opt.bitrate_mode == "Фіксований бітрейт"
+    mbps = max(0.5, min(100.0, float(opt.video_mbps))) if fixed else None
+    cmd += encoder_args(encoder, opt.crf, opt.x264_preset, mbps)
+    if opt.trim_enabled and tlen < info.duration:
+        cmd += ["-t", f"{tlen / (var.tempo or 1.0):.3f}"]
+    if opt.bitrate_cap and not fixed:
         cmd += bitrate_cap_args(info, opt)
     cmd += ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"] \
         if (info.hdr or info.height >= 720) else []
     if info.has_audio:
-        cmd += ["-c:a", "aac", "-b:a", "192k"]
+        ab = opt.audio_bitrate if opt.audio_bitrate in AUDIO_BITRATES else "192k"
+        cmd += ["-c:a", "aac", "-b:a", ab]
     if dst.lower().endswith((".mp4", ".mov", ".m4v")):
         cmd += ["-movflags", "+faststart"]
     cmd += ["-progress", "pipe:1", "-nostats", "-loglevel", "error", dst]
@@ -1056,7 +1097,7 @@ class BatchWorker(threading.Thread):
             return
         assets = assets_for_source(self.assets, self.opt, job.info, self.assets_dir)
         cmd = build_command(self.ffmpeg, job.src, job.dst, job.var, job.info, self.opt, assets)
-        out_dur = job.info.duration / (job.var.tempo or 1.0)
+        out_dur = trim_window(job.info, self.opt)[1] / (job.var.tempo or 1.0)
         ok, err = self._encode(cmd, i, out_dur)
         if self._stop_evt.is_set():
             try:
@@ -1307,6 +1348,12 @@ class App(ctk.CTk, *_DND_BASES):
         self.parallel_var = ctk.IntVar(value=o.parallel)
         self.sharpen_var = ctk.BooleanVar(value=o.sharpen)
         self.cap_var = ctk.BooleanVar(value=o.bitrate_cap)
+        self.trim_var = ctk.BooleanVar(value=o.trim_enabled)
+        self.trim_start_var = ctk.StringVar(value=f"{o.trim_start:g}")
+        self.trim_end_var = ctk.StringVar(value=f"{o.trim_end:g}")
+        self.br_mode_var = ctk.StringVar(value=o.bitrate_mode if o.bitrate_mode in BITRATE_MODES else BITRATE_MODES[0])
+        self.mbps_var = ctk.StringVar(value=f"{o.video_mbps:g}")
+        self.abr_var = ctk.StringVar(value=o.audio_bitrate if o.audio_bitrate in AUDIO_BITRATES else "192k")
         self.res_var = ctk.StringVar(value=o.resolution if o.resolution in RES_OPTIONS else "Як в оригіналі")
         self.fps_var = ctk.StringVar(value=o.fps if o.fps in FPS_OPTIONS else "Як в оригіналі")
         # оформлення
@@ -1396,6 +1443,12 @@ class App(ctk.CTk, *_DND_BASES):
             resolution=self.res_var.get(),
             fps=self.fps_var.get(),
             bitrate_cap=self.cap_var.get(),
+            trim_enabled=self.trim_var.get(),
+            trim_start=self._num(self.trim_start_var.get(), 0.0, 0.0, 600.0),
+            trim_end=self._num(self.trim_end_var.get(), 0.0, 0.0, 600.0),
+            bitrate_mode=self.br_mode_var.get(),
+            video_mbps=self._num(self.mbps_var.get(), 8.0, 0.5, 100.0),
+            audio_bitrate=self.abr_var.get(),
             effect_chance=round(float(self.chance_var.get()), 2),
             **self._ranges(),
             aspect=self.aspect_var.get(),
@@ -1421,6 +1474,13 @@ class App(ctk.CTk, *_DND_BASES):
             lut_enabled=self.lut_enabled_var.get(),
             lut_file=self.lut_file_var.get().strip(),
         )
+
+    @staticmethod
+    def _num(v, default: float, lo: float, hi: float) -> float:
+        try:
+            return round(max(lo, min(hi, float(str(v).replace(",", ".")))), 3)
+        except ValueError:
+            return default
 
     def _ranges(self) -> dict:
         d = Options()
@@ -1468,6 +1528,12 @@ class App(ctk.CTk, *_DND_BASES):
         self.par_label.configure(text=str(o.parallel))
         self.sharpen_var.set(o.sharpen)
         self.cap_var.set(o.bitrate_cap)
+        self.trim_var.set(o.trim_enabled)
+        self.trim_start_var.set(f"{o.trim_start:g}")
+        self.trim_end_var.set(f"{o.trim_end:g}")
+        self.br_mode_var.set(o.bitrate_mode)
+        self.mbps_var.set(f"{o.video_mbps:g}")
+        self.abr_var.set(o.audio_bitrate)
         self.res_var.set(o.resolution)
         self.fps_var.set(o.fps)
         self.aspect_var.set(o.aspect)
@@ -1844,6 +1910,7 @@ class App(ctk.CTk, *_DND_BASES):
                      text_color=HINT).pack(side="left")
 
     def _tab_export(self, tab):
+        tab = self._scrollable(tab)
         tab.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(tab, text="Кодер:").grid(row=0, column=0, sticky="w", padx=12, pady=10)
         ef = ctk.CTkFrame(tab, fg_color="transparent")
@@ -1894,9 +1961,29 @@ class App(ctk.CTk, *_DND_BASES):
         ctk.CTkCheckBox(tab, text="Легке підвищення чіткості (компенсує мʼякість після зуму/масштабування)",
                         variable=self.sharpen_var).grid(row=5, column=0, columnspan=2, sticky="w",
                                                         padx=12, pady=8)
-        ctk.CTkCheckBox(tab, text="Обмежити бітрейт — файли не роздуваються від зерна",
+        ctk.CTkCheckBox(tab, text="Обмежити бітрейт — файли не роздуваються від зерна (у режимі CRF)",
                         variable=self.cap_var).grid(row=6, column=0, columnspan=2, sticky="w",
                                                     padx=12, pady=8)
+
+        ctk.CTkLabel(tab, text="Бітрейт відео:").grid(row=7, column=0, sticky="w", padx=12, pady=10)
+        bf = ctk.CTkFrame(tab, fg_color="transparent")
+        bf.grid(row=7, column=1, sticky="w")
+        ctk.CTkOptionMenu(bf, values=BITRATE_MODES, variable=self.br_mode_var, width=190).pack(side="left")
+        ctk.CTkEntry(bf, textvariable=self.mbps_var, width=60).pack(side="left", padx=(10, 4))
+        ctk.CTkLabel(bf, text="Мбіт/с   (для 1080p зазвичай 6–12)", text_color=HINT).pack(side="left")
+        ctk.CTkLabel(tab, text="Бітрейт звуку:").grid(row=8, column=0, sticky="w", padx=12, pady=10)
+        ctk.CTkOptionMenu(tab, values=AUDIO_BITRATES, variable=self.abr_var, width=110).grid(
+            row=8, column=1, sticky="w")
+
+        tf = ctk.CTkFrame(tab)
+        tf.grid(row=9, column=0, columnspan=2, sticky="ew", padx=8, pady=(10, 6))
+        ctk.CTkSwitch(tf, text="Обрізка", variable=self.trim_var,
+                      font=ctk.CTkFont(weight="bold")).pack(side="left", padx=10, pady=10)
+        ctk.CTkLabel(tf, text="прибрати з початку, с:").pack(side="left", padx=(10, 4))
+        ctk.CTkEntry(tf, textvariable=self.trim_start_var, width=60).pack(side="left")
+        ctk.CTkLabel(tf, text="з кінця, с:").pack(side="left", padx=(14, 4))
+        ctk.CTkEntry(tf, textvariable=self.trim_end_var, width=60).pack(side="left")
+        ctk.CTkLabel(tf, text="  однаково для всіх файлів, напр. 0.25", text_color=HINT).pack(side="left")
 
     def _tab_design(self, tab):
         tab = self._scrollable(tab)
