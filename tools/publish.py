@@ -18,7 +18,8 @@ if not m:
     sys.exit("Не знайдено APP_VERSION у video_variator.py")
 compile(src, "video_variator.py", "exec")  # битий код не публікуємо
 files = {}
-for name in ("video_variator.py",):
+for name in ("video_variator.py", "vv_ai.py"):
+    compile((root / name).read_text(encoding="utf-8"), name, "exec")
     files[name] = hashlib.sha256((root / name).read_bytes()).hexdigest()
 info = {"version": m.group(1), "notes": " ".join(sys.argv[1:]).strip(), "files": files}
 (root / "version.json").write_text(json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

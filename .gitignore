@@ -1,0 +1,6 @@
+__pycache__/
+cache/
+settings.json
+tools/esrgan/
+tools/rife/
+backup/

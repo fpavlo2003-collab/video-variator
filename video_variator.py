@@ -13,7 +13,8 @@ Video Variator 3 — пакетна генерація візуальних ва
   • кодування на CPU або відеокарті (NVIDIA / Intel / AMD) з автовизначенням;
   • паралельна обробка кількох файлів;
   • CSV-звіт з параметрами кожної варіації, відтворюваність через seed;
-  • збереження налаштувань між запусками.
+  • збереження налаштувань між запусками;
+  • (модуль vv_ai.py) розумне кадрування, автосубтитри, автоколір, vidstab, AI-апскейл і плавність.
 
 Залежності: pip install customtkinter pillow ; FFmpeg + FFprobe.
 """
@@ -33,13 +34,18 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field, asdict, fields
+from dataclasses import dataclass, field, asdict, fields, replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, colorchooser
 
 import customtkinter as ctk
 
-APP_VERSION = "3.2.0"
+try:  # розширені покращення (кадрування, субтитри, AI) — окремий модуль поруч
+    import vv_ai as ai
+except Exception:  # noqa: BLE001
+    ai = None
+
+APP_VERSION = "3.3.0"
 APP_TITLE = "Video Variator " + ".".join(APP_VERSION.split(".")[:2])
 UPDATE_REPO = "fpavlo2003-collab/video-variator"
 UPDATE_BRANCH = "main"
@@ -320,7 +326,10 @@ def has_filter(ffmpeg: str, name: str) -> bool:
 
 
 def target_size(info: MediaInfo, res_label: str) -> tuple[int, int]:
-    short = RES_OPTIONS.get(res_label, 0)
+    if isinstance(res_label, str) and res_label.startswith("="):   # службове: точна коротка сторона
+        short = int(res_label[1:])
+    else:
+        short = RES_OPTIONS.get(res_label, 0)
     W, H = info.width, info.height
     if not short:
         return W, H
@@ -452,6 +461,27 @@ class Options:
     loudnorm: bool = True
     lut_enabled: bool = False
     lut_file: str = ""
+    autocolor: bool = False
+    autocolor_strength: float = 0.7
+    vidstab: bool = False
+    voice_clean: bool = False
+    voice_level: str = "Середнє"
+    ai_upscale: bool = False
+    ai_upscale_model: str = "Швидка ×2"
+    smooth_mode: str = "Вимкнено"
+    # розумне кадрування та субтитри
+    smart_reframe: bool = False
+    subs_enabled: bool = False
+    subs_lang: str = "Авто"
+    subs_model: str = "Точна (small)"
+    subs_style: str = "Обводка"
+    subs_color: str = "Жовтий"
+    subs_words: int = 3
+    subs_pos: str = "Знизу"
+    subs_size: float = 0.075
+    subs_upper: bool = True
+    subs_font: str = "Montserrat Bold"
+    subs_srt: bool = True
 
 
 @dataclass
@@ -772,7 +802,28 @@ def prepare_assets(opt: Options, folder: Path) -> dict:
             a["lut"] = True
         else:
             a["warnings"].append("файл LUT не знайдено — LUT пропущено")
+    if opt.subs_enabled and ai is not None:
+        fpath = resolve_font(opt.subs_font) or find_font()
+        if fpath:
+            shutil.copyfile(fpath, folder / ("subfont" + (Path(fpath).suffix.lower() or ".ttf")))
+        a["subs_family"] = ai.font_family(fpath)
     return a
+
+
+def subs_style(opt: Options, assets: dict) -> dict:
+    return {"family": assets.get("subs_family", "Arial"), "size": opt.subs_size, "style": opt.subs_style,
+            "color": opt.subs_color, "words": opt.subs_words, "pos": opt.subs_pos, "upper": opt.subs_upper}
+
+
+def upscale_need(info: MediaInfo, opt: Options, geo: dict | None) -> float:
+    """У скільки разів кадр збільшується до вихідного розміру (для рішення про AI-апскейл)."""
+    CW, CH = canvas_size(info, opt)
+    if geo:
+        return max(CW / geo["w"], CH / geo["h"])
+    if ASPECTS.get(opt.aspect):
+        return min(CW / info.width, CH / info.height)
+    W, H = target_size(info, opt.resolution)
+    return max(W / info.width, H / info.height)
 
 
 def _even(v: float) -> int:
@@ -818,14 +869,22 @@ def build_graph(var: Variation, info: MediaInfo, opt: Options, pix_fmt: str = "y
     assets = assets or {}
     W, H = target_size(info, opt.resolution)
     CW, CH = canvas_size(info, opt)
+    rf = assets.get("reframe")        # розумне кадрування: кадр одразу потрібного формату
+    if rf:
+        W, H = CW, CH
 
     pre: list[str] = []
-    if opt.deshake and not for_preview:
+    if assets.get("vidstab") and not for_preview:
+        pre.append(f"vidstabtransform=input={assets['vidstab']}:smoothing=22:optzoom=1:interpol=bicubic")
+    elif opt.deshake and not for_preview:
         pre.append("deshake")
     if info.hdr and tonemap:
         pre.append(HDR_TO_SDR)
     if opt.denoise:
         pre.append("hqdn3d=2:1.5:3:3")
+    if rf:
+        cmdf = "" if (for_preview or not rf.get("cmd")) else f"sendcmd=f={rf['cmd']},"
+        pre.append(f"{cmdf}crop@rf=w={rf['w']}:h={rf['h']}:x={rf['x']}:y={rf['y']}")
     if var.zoom is not None:
         z = var.zoom
         pre.append(f"crop=trunc(iw/{z}/2)*2:trunc(ih/{z}/2)*2:(iw-ow)*{var.zoom_x}:(ih-oh)*{var.zoom_y}")
@@ -837,7 +896,7 @@ def build_graph(var: Variation, info: MediaInfo, opt: Options, pix_fmt: str = "y
     else:
         pre.append(f"scale={W}:{H}:flags=lanczos")
 
-    post: list[str] = []
+    post: list[str] = list(assets.get("autocolor") or [])
     if var.style:
         post += STYLE_PRESETS[var.style](var.style_strength or 0.6)
     if var.brightness is not None:
@@ -856,6 +915,8 @@ def build_graph(var: Variation, info: MediaInfo, opt: Options, pix_fmt: str = "y
         post.append(f"noise=alls={var.grain}:allf=t+u")
     if var.hflip:
         post.append("hflip")
+    if assets.get("subs"):
+        post.append(f"ass=filename={assets['subs']}:fontsdir=.")
     if assets.get("hook") and not assets.get("hook_png"):
         enable = "" if for_preview else f":enable='lt(t,{float(opt.hook_seconds):.2f})'"
         post.append("drawtext=fontfile=font.ttf:textfile=hook.txt:expansion=none:fontsize=h*0.055"
@@ -879,7 +940,7 @@ def build_graph(var: Variation, info: MediaInfo, opt: Options, pix_fmt: str = "y
 
     parts: list[str] = []
     extra_inputs: list[str] = []
-    if ASPECTS.get(opt.aspect):
+    if ASPECTS.get(opt.aspect) and not rf:
         parts.append("[0:v]" + ",".join(pre + ["split=2[fg0][bg0]"]))
         parts.append(f"[bg0]scale={CW}:{CH}:force_original_aspect_ratio=increase,crop={CW}:{CH},"
                      f"boxblur=20:3,eq=brightness=-0.06[bg]")
@@ -922,6 +983,9 @@ def build_graph(var: Variation, info: MediaInfo, opt: Options, pix_fmt: str = "y
     if info.has_audio and not for_preview:
         if var.tempo is not None:
             af.append(f"atempo={var.tempo}")
+        if opt.voice_clean and ai is not None:
+            nr = ai.VOICE_LEVELS.get(opt.voice_level, 14)
+            af.append(f"highpass=f=70,afftdn=nr={nr}:nf=-44:tn=1")
         if opt.loudnorm:
             af.append("loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000")
     return ";".join(parts), extra_inputs, (",".join(af) or None)
@@ -1000,6 +1064,9 @@ class Job:
     name: str
     info: MediaInfo
     var: Variation
+    opt: Options | None = None
+    assets: dict | None = None
+    orig: str = ""
 
 
 class BatchWorker(threading.Thread):
@@ -1048,6 +1115,8 @@ class BatchWorker(threading.Thread):
         width = max(3, len(str(self.count)))
         jobs: list[Job] = []
         for si, src in enumerate(self.sources):
+            if self._stop_evt.is_set():
+                return
             try:
                 info = probe(ffprobe, src)
             except Exception as exc:  # noqa: BLE001
@@ -1063,13 +1132,17 @@ class BatchWorker(threading.Thread):
                 self.emit("log", text="   HDR-відео: " + (
                     "конвертую в SDR (BT.709), щоб кольори не вигоріли" if has_filter(self.ffmpeg, "zscale")
                     else "⚠ у вашому FFmpeg немає zscale — кольори можуть бути блідими"))
-            for var in plan_variations(self.count, self.opt, info, source_rng(self.seed, si)):
+            plan = plan_variations(self.count, self.opt, info, source_rng(self.seed, si))
+            esrc, einfo, sopt, sassets = self._prepare(si, src, info, len(self.sources))
+            if self._stop_evt.is_set():
+                return
+            for var in plan:
                 name = f"{sp.stem}_var_{var.index:0{width}d}{ext}"
                 n = 1
                 while (Path(self.out_dir) / name).exists():  # ніколи не перезаписуємо старі файли
                     n += 1
                     name = f"{sp.stem}_var_{var.index:0{width}d}_{n}{ext}"
-                jobs.append(Job(src, str(Path(self.out_dir) / name), name, info, var))
+                jobs.append(Job(esrc, str(Path(self.out_dir) / name), name, einfo, var, sopt, sassets, src))
         if not jobs:
             raise RuntimeError("Немає жодного придатного відео для обробки.")
 
@@ -1092,12 +1165,133 @@ class BatchWorker(threading.Thread):
                 writer.writerows(rows)
             self.emit("log", text=f"Звіт параметрів: {report.name}")
 
+    # --- підготовка відео: AI, кадрування, колір, стабілізація, субтитри ---
+    def _reg(self, p):
+        with self._lock:
+            self._procs.add(p)
+
+    def _unreg(self, p):
+        with self._lock:
+            self._procs.discard(p)
+
+    def _prepare(self, si: int, src: str, info: MediaInfo, n_src: int):
+        opt = self.opt
+        assets = dict(self.assets)
+        if ai is None:
+            if opt.smart_reframe or opt.subs_enabled or opt.ai_upscale or opt.autocolor or opt.vidstab \
+                    or opt.smooth_mode != "Вимкнено":
+                self.emit("log", text="⚠ модуль vv_ai.py не знайдено — розширені покращення пропущено")
+            return src, info, opt, assets
+        log = lambda t: self.emit("log", text=t)  # noqa: E731
+
+        def prog(frac: float, label: str):
+            self.emit("progress", value=min(1.0, (si + max(0.0, min(1.0, frac))) / n_src),
+                      label=f"Підготовка {si + 1}/{n_src}: {label}")
+        ctx = ai.Ctx(self.ffmpeg, log, prog, self._stop_evt, self._reg, self._unreg)
+        orig_src = src
+        tm = HDR_TO_SDR if (info.hdr and has_filter(self.ffmpeg, "zscale")) else None
+        ratio = ASPECTS.get(opt.aspect)
+        geo = None
+        if opt.smart_reframe and ratio:
+            if ai.component_ready("opencv"):
+                geo = ai.reframe_geometry(info.width, info.height, ratio)
+            else:
+                log("⚠ Розумне кадрування потребує OpenCV — встановіть на вкладці «Оформлення»")
+
+        if opt.ai_upscale or opt.smooth_mode != "Вимкнено":
+            need = upscale_need(info, opt, geo)
+            need_short = _even(min(info.width, info.height) * need)
+            t0, tlen = trim_window(info, opt)
+            try:
+                res = ai.prepare_ai_source(ctx, src, info, t0, tlen,
+                                           opt.ai_upscale_model if opt.ai_upscale else None, need_short,
+                                           opt.smooth_mode, tm, lambda x: probe(find_ffprobe(self.ffmpeg), x))
+            except Exception as exc:  # noqa: BLE001
+                if self._stop_evt.is_set():
+                    return src, info, opt, assets
+                log(f"⚠ AI-обробку пропущено: {exc}")
+                res = None
+            if res:
+                W0, H0 = target_size(info, opt.resolution)
+                opt = replace(opt, trim_enabled=False, resolution=f"={min(W0, H0)}")
+                src, info = res
+                tm = None
+                if geo:
+                    geo = ai.reframe_geometry(info.width, info.height, ratio)
+                log(f"   AI-обробка готова: {info.width}×{info.height} @ {info.fps:.0f} к/с, {info.duration:.1f} с")
+        t0, tlen = trim_window(info, opt)
+
+        if geo and not self._stop_evt.is_set():
+            try:
+                data = ai.analyze_reframe(ctx, src, info, t0, tlen, geo, 0.0, 0.35)
+                name = f"rf_{si}.txt"
+                ai.write_reframe_cmds(self.assets_dir / name, data, geo, info.fps, tlen)
+                p0 = ai.reframe_start(data, geo)
+                assets["reframe"] = {"w": geo["w"], "h": geo["h"], "cmd": name,
+                                     "x": p0 if geo["axis"] == "x" else 0, "y": p0 if geo["axis"] == "y" else 0}
+                found, total = data.get("found", 0), max(1, data.get("total", 1))
+                log(f"   розумне кадрування: об'єкт у кадрі знайдено в {found * 100 // total}% моментів")
+            except Exception as exc:  # noqa: BLE001
+                log(f"⚠ Розумне кадрування пропущено: {exc}")
+
+        if opt.autocolor and not self._stop_evt.is_set():
+            prog(0.36, "автокорекція кольору")
+            st = ai.analyze_color(ctx, src, info, t0, tlen, tm)
+            if st:
+                assets["autocolor"] = ai.color_filters(st, opt.autocolor_strength)
+                log(f"   автокорекція кольору: {', '.join(assets['autocolor'])}")
+            else:
+                log("⚠ автокорекцію кольору пропущено (не вдалося проаналізувати кадри)")
+
+        if opt.vidstab and not self._stop_evt.is_set():
+            if has_filter(self.ffmpeg, "vidstabdetect") and has_filter(self.ffmpeg, "vidstabtransform"):
+                name = f"stab_{si}.trf"
+                if ai.vidstab_detect(ctx, src, info, t0, tlen, self.assets_dir, name, 0.4, 0.2):
+                    assets["vidstab"] = name
+            else:
+                log("⚠ у вашому FFmpeg немає vidstab — використаю звичайну стабілізацію")
+                opt = replace(opt, deshake=True)
+
+        if opt.subs_enabled and not self._stop_evt.is_set():
+            own = Path(orig_src).with_suffix(".srt")
+            if not has_filter(self.ffmpeg, "ass"):
+                log("⚠ у вашому FFmpeg немає libass — субтитри пропущено")
+            elif not (own.is_file() or ai.component_ready("whisper")):
+                log("⚠ Автосубтитри потребують Whisper — встановіть на вкладці «Оформлення»")
+            else:
+                try:
+                    segs = ai.transcribe(ctx, src, info, t0, tlen, opt.subs_model, opt.subs_lang, 0.6, 0.4,
+                                         srt_from=orig_src)
+                except Exception as exc:  # noqa: BLE001
+                    segs = []
+                    log(f"⚠ Субтитри пропущено: {exc}")
+                if segs:
+                    CW, CH = canvas_size(info, opt)
+                    name = f"subs_{si}.ass"
+                    (self.assets_dir / name).write_text(ai.build_ass(segs, CW, CH, subs_style(opt, assets)),
+                                                        encoding="utf-8")
+                    assets["subs"] = name
+                    log(f"   субтитри: {len(segs)} фраз")
+                    if opt.subs_srt and not own.is_file():
+                        srt = Path(self.out_dir) / f"{Path(orig_src).stem}.srt"
+                        try:
+                            ai.write_srt(segs, srt)
+                            log(f"   текст збережено: {srt.name} (виправте й покладіть поруч із відео — "
+                                f"наступного разу візьму його)")
+                        except OSError:
+                            pass
+                elif not self._stop_evt.is_set():
+                    log("   субтитри: мовлення не знайдено")
+        return src, info, opt, assets
+
     def _run_job(self, i: int, job: Job, results: list):
         if self._stop_evt.is_set():
             return
-        assets = assets_for_source(self.assets, self.opt, job.info, self.assets_dir)
-        cmd = build_command(self.ffmpeg, job.src, job.dst, job.var, job.info, self.opt, assets)
-        out_dur = trim_window(job.info, self.opt)[1] / (job.var.tempo or 1.0)
+        opt = job.opt or self.opt
+        assets = assets_for_source(job.assets if job.assets is not None else self.assets, opt, job.info,
+                                   self.assets_dir)
+        cmd = build_command(self.ffmpeg, job.src, job.dst, job.var, job.info, opt, assets)
+        out_dur = trim_window(job.info, opt)[1] / (job.var.tempo or 1.0)
         ok, err = self._encode(cmd, i, out_dur)
         if self._stop_evt.is_set():
             try:
@@ -1108,10 +1302,10 @@ class BatchWorker(threading.Thread):
             return
         self._set_fraction(i, 1.0, force=True)
         if ok:
-            if self.opt.thumbnails:
+            if opt.thumbnails:
                 self._thumbnail(job.dst, out_dur)
             self.emit("log", text=f"✔ {job.name}: {job.var.describe()}")
-            row = {"source": Path(job.src).name, "file": job.name}
+            row = {"source": Path(job.orig or job.src).name, "file": job.name}
             row.update(asdict(job.var))
             results[i] = row
         else:
@@ -1178,41 +1372,91 @@ class PreviewWorker(threading.Thread):
         self.src, self.count = os.path.abspath(src), count
         self.opt, self.seed, self.events = opt, seed, events
 
+    def _extra_assets(self, info: MediaInfo, assets: dict, tmp: Path, t: float, tonemap: bool) -> list[str]:
+        """Кадрування, автоколір і приклад субтитрів для превʼю. Повертає примітки."""
+        notes: list[str] = []
+        if ai is None:
+            return notes
+        opt = self.opt
+        quiet = ai.Ctx(self.ffmpeg, lambda _t: None, lambda _f, _l: None, threading.Event())
+        tm = HDR_TO_SDR if (info.hdr and tonemap) else None
+        ratio = ASPECTS.get(opt.aspect)
+        if opt.smart_reframe and ratio:
+            geo = ai.reframe_geometry(info.width, info.height, ratio) if ai.component_ready("opencv") else None
+            if geo:
+                try:
+                    a0 = max(0.0, t - 1.0)
+                    data = ai.analyze_reframe(quiet, self.src, info, a0, min(2.0, max(0.5, info.duration - a0)), geo)
+                    p0 = ai.reframe_start(data, geo, t - a0)
+                    assets["reframe"] = {"w": geo["w"], "h": geo["h"], "cmd": None,
+                                         "x": p0 if geo["axis"] == "x" else 0, "y": p0 if geo["axis"] == "y" else 0}
+                except Exception:  # noqa: BLE001
+                    pass
+            elif not ai.component_ready("opencv"):
+                notes.append("розумне кадрування: потрібен OpenCV")
+        if opt.autocolor:
+            t0, tlen = trim_window(info, opt)
+            st = ai.analyze_color(quiet, self.src, info, t0, tlen, tm)
+            if st:
+                assets["autocolor"] = ai.color_filters(st, opt.autocolor_strength)
+        if opt.subs_enabled:
+            CW, CH = canvas_size(info, opt)
+            (tmp / "subs_prev.ass").write_text(ai.preview_ass(CW, CH, subs_style(opt, assets)), encoding="utf-8")
+            assets["subs"] = "subs_prev.ass"
+        if opt.ai_upscale or opt.smooth_mode != "Вимкнено" or opt.vidstab:
+            notes.append("AI-апскейл, плавність і стабілізація у превʼю не показуються — лише в готових відео")
+        return notes
+
     def run(self):
         try:
             info = probe(find_ffprobe(self.ffmpeg), self.src)
             plan = plan_variations(self.count, self.opt, info, source_rng(self.seed, 0))
             tmp = Path(tempfile.mkdtemp(prefix="vvar_preview_"))
             assets = prepare_assets(self.opt, tmp)
-            info_assets = None
             tonemap = has_filter(self.ffmpeg, "zscale")
             has_cas = has_filter(self.ffmpeg, "cas")
             t = max(0.0, info.duration * 0.4)
+            self.events.put(("progress", {"value": 0.02, "label": "Превʼю: аналіз кадру…"}))
+            notes = self._extra_assets(info, assets, tmp, t, tonemap)
+            info_assets = assets_for_source(assets, self.opt, info, tmp)
+            CW, CH = canvas_size(info, self.opt)
             items = []
-            frames = [(None, "Оригінал")] + [(v, f"#{v.index:03d}  {v.describe()}")
-                                              for v in plan[:self.MAX_FRAMES]]
+            compare: dict = {"before": None, "afters": []}
+            frames = ([(None, "Оригінал"), ("before", "До"), (Variation(index=0), "Тільки покращення")] +
+                      [(v, f"#{v.index:03d}  {v.describe()}") for v in plan[:self.MAX_FRAMES]])
+            tm_chain = (HDR_TO_SDR + ",") if (info.hdr and tonemap) else ""
             for n, (var, caption) in enumerate(frames):
                 out = tmp / f"f{n:02d}.png"
                 cmd = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                        "-ss", f"{t:.3f}", "-i", self.src]
                 if var is None:
-                    orig = (HDR_TO_SDR + ",scale=480:-2") if (info.hdr and tonemap) else "scale=480:-2"
-                    cmd += ["-frames:v", "1", "-vf", orig, str(out)]
+                    cmd += ["-frames:v", "1", "-vf", tm_chain + "scale=480:-2", str(out)]
+                elif var == "before":
+                    vf = (f"{tm_chain}scale={CW}:{CH}:force_original_aspect_ratio=increase,crop={CW}:{CH},"
+                          f"scale=540:-2")
+                    cmd += ["-frames:v", "1", "-vf", vf, str(out)]
                 else:
-                    if info_assets is None:
-                        info_assets = assets_for_source(assets, self.opt, info, tmp)
                     fc, extra, _ = build_graph(var, info, self.opt, tonemap=tonemap, for_preview=True,
-                                               assets=info_assets, has_cas=has_cas, tail="scale=480:-2")
+                                               assets=info_assets, has_cas=has_cas, tail="scale=540:-2")
                     for e in extra:
                         cmd += ["-i", e]
                     cmd += ["-filter_complex", fc, "-map", "[vout]", "-frames:v", "1", str(out)]
                 r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                                    errors="replace", cwd=str(tmp), creationflags=_NO_WINDOW)
                 if r.returncode == 0 and out.exists():
-                    items.append((str(out), caption))
+                    if var == "before":
+                        compare["before"] = str(out)
+                    else:
+                        items.append((str(out), caption))
+                        if var is not None:
+                            compare["afters"].append((caption.split("  ")[0], str(out)))
+                elif r.returncode != 0 and var is not None and var != "before":
+                    err = (r.stderr or "").strip().splitlines()
+                    notes.append(f"{caption.split('  ')[0]}: {err[-1] if err else 'помилка'}")
                 self.events.put(("progress", {"value": (n + 1) / len(frames),
                                               "label": f"Превʼю {n + 1} з {len(frames)}"}))
-            self.events.put(("preview", {"items": items, "total": len(plan)}))
+            self.events.put(("preview", {"items": items, "total": len(plan), "compare": compare,
+                                         "notes": notes}))
         except Exception as exc:  # noqa: BLE001
             self.events.put(("error", {"message": str(exc)}))
         finally:
@@ -1383,6 +1627,35 @@ class App(ctk.CTk, *_DND_BASES):
         self.loudnorm_var = ctk.BooleanVar(value=o.loudnorm)
         self.lut_enabled_var = ctk.BooleanVar(value=o.lut_enabled)
         self.lut_file_var = ctk.StringVar(value=o.lut_file)
+        A = ai
+        self.autocolor_var = ctk.BooleanVar(value=o.autocolor)
+        self.autocolor_str_var = ctk.DoubleVar(value=o.autocolor_strength)
+        self.vidstab_var = ctk.BooleanVar(value=o.vidstab)
+        self.voice_var = ctk.BooleanVar(value=o.voice_clean)
+        voice_levels = list(A.VOICE_LEVELS) if A else ["Середнє"]
+        self.voice_level_var = ctk.StringVar(value=o.voice_level if o.voice_level in voice_levels else "Середнє")
+        self.upscale_var = ctk.BooleanVar(value=o.ai_upscale)
+        up_models = list(A.UPSCALE_MODELS) if A else ["Швидка ×2"]
+        self.upscale_model_var = ctk.StringVar(value=o.ai_upscale_model if o.ai_upscale_model in up_models
+                                               else up_models[0])
+        smooth = A.SMOOTH_MODES if A else ["Вимкнено"]
+        self.smooth_var = ctk.StringVar(value=o.smooth_mode if o.smooth_mode in smooth else "Вимкнено")
+        self.reframe_var = ctk.BooleanVar(value=o.smart_reframe)
+        self.subs_var = ctk.BooleanVar(value=o.subs_enabled)
+        self.subs_lang_var = ctk.StringVar(value=o.subs_lang)
+        self.subs_model_var = ctk.StringVar(value=o.subs_model)
+        self.subs_style_var = ctk.StringVar(value=o.subs_style)
+        self.subs_color_var = ctk.StringVar(value=o.subs_color)
+        self.subs_words_var = ctk.IntVar(value=o.subs_words)
+        self.subs_pos_var = ctk.StringVar(value=o.subs_pos)
+        self.subs_size_var = ctk.DoubleVar(value=o.subs_size)
+        self.subs_upper_var = ctk.BooleanVar(value=o.subs_upper)
+        self.subs_font_var = ctk.StringVar(value=o.subs_font if (o.subs_font in self.font_names
+                                                                 or os.path.isfile(o.subs_font))
+                                           else self.hook_font_var.get())
+        self.subs_srt_var = ctk.BooleanVar(value=o.subs_srt)
+        self.comp_widgets: dict[str, list] = {}
+        self._installing: set[str] = set()
         self.preset_var = ctk.StringVar(value="— пресет —")
 
         self._build_ui()
@@ -1473,6 +1746,26 @@ class App(ctk.CTk, *_DND_BASES):
             loudnorm=self.loudnorm_var.get(),
             lut_enabled=self.lut_enabled_var.get(),
             lut_file=self.lut_file_var.get().strip(),
+            autocolor=self.autocolor_var.get(),
+            autocolor_strength=round(float(self.autocolor_str_var.get()), 2),
+            vidstab=self.vidstab_var.get(),
+            voice_clean=self.voice_var.get(),
+            voice_level=self.voice_level_var.get(),
+            ai_upscale=self.upscale_var.get(),
+            ai_upscale_model=self.upscale_model_var.get(),
+            smooth_mode=self.smooth_var.get(),
+            smart_reframe=self.reframe_var.get(),
+            subs_enabled=self.subs_var.get(),
+            subs_lang=self.subs_lang_var.get(),
+            subs_model=self.subs_model_var.get(),
+            subs_style=self.subs_style_var.get(),
+            subs_color=self.subs_color_var.get(),
+            subs_words=int(self.subs_words_var.get()),
+            subs_pos=self.subs_pos_var.get(),
+            subs_size=round(float(self.subs_size_var.get()), 3),
+            subs_upper=self.subs_upper_var.get(),
+            subs_font=self.subs_font_var.get(),
+            subs_srt=self.subs_srt_var.get(),
         )
 
     @staticmethod
@@ -1559,6 +1852,26 @@ class App(ctk.CTk, *_DND_BASES):
         self.loudnorm_var.set(o.loudnorm)
         self.lut_enabled_var.set(o.lut_enabled)
         self.lut_file_var.set(o.lut_file)
+        self.autocolor_var.set(o.autocolor)
+        self.autocolor_str_var.set(o.autocolor_strength)
+        self.vidstab_var.set(o.vidstab)
+        self.voice_var.set(o.voice_clean)
+        self.voice_level_var.set(o.voice_level)
+        self.upscale_var.set(o.ai_upscale)
+        self.upscale_model_var.set(o.ai_upscale_model)
+        self.smooth_var.set(o.smooth_mode)
+        self.reframe_var.set(o.smart_reframe)
+        self.subs_var.set(o.subs_enabled)
+        self.subs_lang_var.set(o.subs_lang)
+        self.subs_model_var.set(o.subs_model)
+        self.subs_style_var.set(o.subs_style)
+        self.subs_color_var.set(o.subs_color)
+        self.subs_words_var.set(o.subs_words)
+        self.subs_pos_var.set(o.subs_pos)
+        self.subs_size_var.set(o.subs_size)
+        self.subs_upper_var.set(o.subs_upper)
+        self.subs_font_var.set(o.subs_font)
+        self.subs_srt_var.set(o.subs_srt)
         self._refresh_labels()
 
     def _refresh_labels(self):
@@ -1567,6 +1880,11 @@ class App(ctk.CTk, *_DND_BASES):
         self.hook_size_label.configure(text=f"{self.hook_size_var.get() / 0.07:.0%}")
         d = self.detail_var.get()
         self.detail_label.configure(text="вимк." if d <= 0 else f"{d:.0%}")
+        if hasattr(self, "autocolor_label"):
+            self.autocolor_label.configure(text=f"{self.autocolor_str_var.get():.0%}")
+        if hasattr(self, "subs_size_label"):
+            self.subs_size_label.configure(text=f"{self.subs_size_var.get() / 0.075:.0%}")
+            self.subs_words_label.configure(text=str(int(self.subs_words_var.get())))
 
     # --- пресети -----------------------------------------------------------
     def _preset_names(self) -> list[str]:
@@ -1995,6 +2313,14 @@ class App(ctk.CTk, *_DND_BASES):
         ctk.CTkOptionMenu(af, values=list(ASPECTS), variable=self.aspect_var, width=210).pack(side="left")
         ctk.CTkLabel(af, text="  інший формат → відео по центру, по краях розмитий фон",
                      text_color=HINT).pack(side="left")
+        r += 1
+        rf = ctk.CTkFrame(tab)
+        rf.grid(row=r, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 4))
+        ctk.CTkSwitch(rf, text="Розумне кадрування", variable=self.reframe_var,
+                      font=ctk.CTkFont(weight="bold")).pack(side="left", padx=10, pady=8)
+        ctk.CTkLabel(rf, text="замість розмитого фону кадр заповнює весь екран, а «камера» стежить "
+                              "за обличчям / людиною", text_color=HINT).pack(side="left")
+        self._comp_button(rf, "opencv").pack(side="right", padx=10)
 
         r += 1
         wm = ctk.CTkFrame(tab)
@@ -2053,11 +2379,61 @@ class App(ctk.CTk, *_DND_BASES):
         self.hook_size_label.pack(side="left")
 
         r += 1
+        sb = ctk.CTkFrame(tab)
+        sb.grid(row=r, column=0, columnspan=2, sticky="ew", padx=8, pady=4)
+        top = ctk.CTkFrame(sb, fg_color="transparent")
+        top.pack(fill="x", padx=10, pady=(8, 2))
+        ctk.CTkSwitch(top, text="Автосубтитри", variable=self.subs_var,
+                      font=ctk.CTkFont(weight="bold")).pack(side="left")
+        ctk.CTkLabel(top, text="  програма сама розпізнає мову (без інтернету) і накладає текст як у CapCut",
+                     text_color=HINT).pack(side="left")
+        self._comp_button(top, "whisper").pack(side="right")
+        A = ai
+        r1 = ctk.CTkFrame(sb, fg_color="transparent")
+        r1.pack(fill="x", padx=10, pady=4)
+        ctk.CTkLabel(r1, text="Мова:").pack(side="left")
+        ctk.CTkOptionMenu(r1, values=list(A.SUB_LANGS) if A else ["Авто"], variable=self.subs_lang_var,
+                          width=120).pack(side="left", padx=(6, 14))
+        ctk.CTkLabel(r1, text="Розпізнавання:").pack(side="left")
+        ctk.CTkOptionMenu(r1, values=list(A.WHISPER_MODELS) if A else ["Точна (small)"],
+                          variable=self.subs_model_var, width=170).pack(side="left", padx=(6, 14))
+        ctk.CTkLabel(r1, text="Шрифт:").pack(side="left")
+        ctk.CTkOptionMenu(r1, values=self.font_names, variable=self.subs_font_var, width=160
+                          ).pack(side="left", padx=6)
+        r2 = ctk.CTkFrame(sb, fg_color="transparent")
+        r2.pack(fill="x", padx=10, pady=4)
+        ctk.CTkOptionMenu(r2, values=A.SUB_STYLES if A else ["Обводка"], variable=self.subs_style_var,
+                          width=110).pack(side="left")
+        ctk.CTkLabel(r2, text="  Підсвітка слова:").pack(side="left")
+        ctk.CTkOptionMenu(r2, values=list(A.SUB_COLORS) if A else ["Жовтий"], variable=self.subs_color_var,
+                          width=130).pack(side="left", padx=6)
+        ctk.CTkOptionMenu(r2, values=A.SUB_POSITIONS if A else ["Знизу"], variable=self.subs_pos_var,
+                          width=110).pack(side="left", padx=8)
+        ctk.CTkCheckBox(r2, text="ВЕЛИКІ ЛІТЕРИ", variable=self.subs_upper_var).pack(side="left", padx=8)
+        r3 = ctk.CTkFrame(sb, fg_color="transparent")
+        r3.pack(fill="x", padx=10, pady=(4, 2))
+        ctk.CTkLabel(r3, text="Слів у рядку:").pack(side="left")
+        ctk.CTkSlider(r3, from_=1, to=6, number_of_steps=5, variable=self.subs_words_var, width=110,
+                      command=lambda v: self._refresh_labels()).pack(side="left", padx=4)
+        self.subs_words_label = ctk.CTkLabel(r3, text="", width=24)
+        self.subs_words_label.pack(side="left")
+        ctk.CTkLabel(r3, text="   Розмір:").pack(side="left")
+        ctk.CTkSlider(r3, from_=0.04, to=0.13, number_of_steps=18, variable=self.subs_size_var, width=120,
+                      command=lambda v: self._refresh_labels()).pack(side="left", padx=4)
+        self.subs_size_label = ctk.CTkLabel(r3, text="", width=44)
+        self.subs_size_label.pack(side="left")
+        ctk.CTkCheckBox(r3, text="Зберігати текст у .srt", variable=self.subs_srt_var).pack(side="left", padx=12)
+        ctk.CTkLabel(sb, text="Порада: виправте помилки у збереженому .srt і покладіть його поруч із відео "
+                              "з тією ж назвою — програма візьме ваш текст замість розпізнаного.",
+                     text_color=HINT, wraplength=820, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
+
+        r += 1
         ctk.CTkCheckBox(tab, text="Робити обкладинку (JPG-кадр) для кожного відео",
                         variable=self.thumbs_var).grid(row=r, column=0, columnspan=2, sticky="w",
                                                        padx=12, pady=(8, 4))
 
     def _tab_enhance(self, tab):
+        tab = self._scrollable(tab)
         tab.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(tab, text="Деталізація:").grid(row=0, column=0, sticky="w", padx=12, pady=10)
         df = ctk.CTkFrame(tab, fg_color="transparent")
@@ -2068,25 +2444,133 @@ class App(ctk.CTk, *_DND_BASES):
         self.detail_label.pack(side="left", padx=6)
         ctk.CTkLabel(df, text="розумне підвищення різкості дрібних деталей (CAS)",
                      text_color=HINT).pack(side="left")
+
+        ac = ctk.CTkFrame(tab, fg_color="transparent")
+        ac.grid(row=1, column=0, columnspan=2, sticky="w", padx=12, pady=6)
+        ctk.CTkCheckBox(ac, text="Автокорекція кольору та експозиції — вирівнює темні, «жовті», бляклі кадри",
+                        variable=self.autocolor_var).pack(side="left")
+        ctk.CTkLabel(ac, text="   сила:").pack(side="left")
+        ctk.CTkSlider(ac, from_=0.2, to=1.0, number_of_steps=16, variable=self.autocolor_str_var, width=120,
+                      command=lambda v: self._refresh_labels()).pack(side="left", padx=4)
+        self.autocolor_label = ctk.CTkLabel(ac, text="", width=44)
+        self.autocolor_label.pack(side="left")
+
         items = [
             (self.denoise_var, "Шумоподавлення — прибирає «шум» з темних кадрів і нічної зйомки"),
-            (self.deshake_var, "Стабілізація — згладжує тремтіння відео з рук (обробка повільніша)"),
+            (self.deshake_var, "Стабілізація швидка — згладжує легке тремтіння"),
+            (self.vidstab_var, "Стабілізація якісна (2 проходи, vidstab) — для зйомки з рук на ходу"),
             (self.loudnorm_var, "Нормалізація гучності — усі ролики звучать однаково голосно (−14 LUFS)"),
         ]
-        for n, (var, text) in enumerate(items, start=1):
+        for n, (var, text) in enumerate(items, start=2):
             ctk.CTkCheckBox(tab, text=text, variable=var).grid(row=n, column=0, columnspan=2, sticky="w",
-                                                              padx=12, pady=8)
+                                                              padx=12, pady=6)
+        vc = ctk.CTkFrame(tab, fg_color="transparent")
+        vc.grid(row=6, column=0, columnspan=2, sticky="w", padx=12, pady=6)
+        ctk.CTkCheckBox(vc, text="Очищення голосу — прибирає шум вітру, гул і фон",
+                        variable=self.voice_var).pack(side="left")
+        ctk.CTkOptionMenu(vc, values=list(ai.VOICE_LEVELS) if ai else ["Середнє"],
+                          variable=self.voice_level_var, width=110).pack(side="left", padx=10)
+
         lf = ctk.CTkFrame(tab)
-        lf.grid(row=4, column=0, columnspan=2, sticky="ew", padx=8, pady=(10, 4))
+        lf.grid(row=7, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 4))
         lf.grid_columnconfigure(1, weight=1)
         ctk.CTkSwitch(lf, text="LUT (кольоровий фільтр .cube)", variable=self.lut_enabled_var).grid(
             row=0, column=0, sticky="w", padx=10, pady=10)
         ctk.CTkEntry(lf, textvariable=self.lut_file_var, placeholder_text="шлях до файлу .cube").grid(
             row=0, column=1, sticky="ew", padx=6)
         ctk.CTkButton(lf, text="Огляд…", width=80, command=self._pick_lut).grid(row=0, column=2, padx=10)
-        ctk.CTkLabel(tab, text="Порада: перевіряйте результат кнопкою «👁 Превʼю» перед рендером.",
-                     text_color=HINT).grid(row=5, column=0, columnspan=2, sticky="w", padx=12, pady=8)
+
+        aib = ctk.CTkFrame(tab)
+        aib.grid(row=8, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 4))
+        ctk.CTkLabel(aib, text="🧠 AI-покращення (працюють на відеокарті, обробка повільніша)",
+                     font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(8, 4))
+        u = ctk.CTkFrame(aib, fg_color="transparent")
+        u.pack(fill="x", padx=10, pady=4)
+        ctk.CTkSwitch(u, text="AI-апскейл (Real-ESRGAN)", variable=self.upscale_var).pack(side="left")
+        ctk.CTkOptionMenu(u, values=list(ai.UPSCALE_MODELS) if ai else ["Швидка ×2"],
+                          variable=self.upscale_model_var, width=190).pack(side="left", padx=10)
+        self._comp_button(u, "esrgan").pack(side="right")
+        ctk.CTkLabel(aib, text="домальовує деталі, коли відео менше за вихідний розмір (720p → 1080p, "
+                               "кроп під 9:16). Вмикається лише коли справді потрібно.",
+                     text_color=HINT, wraplength=820, justify="left").pack(anchor="w", padx=10)
+        m = ctk.CTkFrame(aib, fg_color="transparent")
+        m.pack(fill="x", padx=10, pady=(8, 4))
+        ctk.CTkLabel(m, text="Плавність кадрів:").pack(side="left")
+        ctk.CTkOptionMenu(m, values=ai.SMOOTH_MODES if ai else ["Вимкнено"], variable=self.smooth_var,
+                          width=170).pack(side="left", padx=10)
+        self._comp_button(m, "rife").pack(side="right")
+        ctk.CTkLabel(aib, text="AI домальовує проміжні кадри: плавні 60 к/с або справжнє сповільнення ×2. "
+                               "Без RIFE працює через FFmpeg (гірше на швидкому русі).",
+                     text_color=HINT, wraplength=820, justify="left").pack(anchor="w", padx=10)
+        cf = ctk.CTkFrame(aib, fg_color="transparent")
+        cf.pack(fill="x", padx=10, pady=(8, 10))
+        self.cache_label = ctk.CTkLabel(cf, text="", text_color=HINT)
+        self.cache_label.pack(side="left")
+        ctk.CTkButton(cf, text="Очистити кеш", width=120, fg_color=SECONDARY, hover_color=SECONDARY_HOVER,
+                      text_color=SECONDARY_TEXT, command=self._clear_cache).pack(side="right")
+        self._update_cache_label()
+        ctk.CTkLabel(tab, text="Порада: кнопка «👁 Превʼю» показує порівняння «до / після» з повзунком.",
+                     text_color=HINT).grid(row=9, column=0, columnspan=2, sticky="w", padx=12, pady=8)
         self._refresh_labels()
+
+    # --- компоненти (OpenCV, Whisper, Real-ESRGAN, RIFE) --------------------
+    def _comp_button(self, parent, name: str):
+        btn = ctk.CTkButton(parent, text="", width=190, command=lambda: self._install_component(name),
+                            fg_color=SECONDARY, hover_color=SECONDARY_HOVER, text_color=SECONDARY_TEXT)
+        self.comp_widgets.setdefault(name, []).append(btn)
+        self._refresh_comp(name)
+        return btn
+
+    def _refresh_comp(self, name: str):
+        if ai is None:
+            text, state = "немає модуля vv_ai", "disabled"
+        elif name in self._installing:
+            text, state = "Встановлюю…", "disabled"
+        elif ai.component_ready(name):
+            text, state = f"✔ {ai.COMPONENTS[name]['title']} готовий", "disabled"
+        elif not ai.component_installable(name):
+            text, state = "недоступно в .exe", "disabled"
+        else:
+            c = ai.COMPONENTS[name]
+            text, state = f"⬇ Встановити {c['title']} ({c['size']})", "normal"
+        for b in self.comp_widgets.get(name, []):
+            b.configure(text=text, state=state)
+
+    def _install_component(self, name: str):
+        if ai is None or name in self._installing:
+            return
+        c = ai.COMPONENTS[name]
+        if not messagebox.askyesno(APP_TITLE, f"Завантажити та встановити {c['title']} ({c['size']}) "
+                                              f"для {c['for']}?\nПотрібен інтернет, це робиться один раз."):
+            return
+        self._installing.add(name)
+        self._refresh_comp(name)
+
+        def job():
+            ok = False
+            try:
+                ok = ai.install_component(
+                    name, lambda t: self.events.put(("log", {"text": t})),
+                    lambda f, label: self.events.put(("progress", {"value": f, "label": label})))
+            except Exception as exc:  # noqa: BLE001
+                self.events.put(("log", {"text": f"✖ {c['title']}: {exc}"}))
+            self.events.put(("comp_done", {"name": name, "ok": ok}))
+        threading.Thread(target=job, daemon=True).start()
+
+    def _update_cache_label(self):
+        if ai is not None and hasattr(self, "cache_label"):
+            mb = ai.cache_size_mb()
+            self.cache_label.configure(text=f"Кеш аналізу та AI-обробки: {mb:.0f} МБ "
+                                            f"(щоб повторний рендер того ж відео був миттєвим)")
+
+    def _clear_cache(self):
+        if ai is None:
+            return
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo(APP_TITLE, "Зачекайте, поки завершиться обробка.")
+            return
+        ai.clear_cache()
+        self._update_cache_label()
 
     def _pick_logo(self):
         p = filedialog.askopenfilename(title="Логотип", filetypes=[("Зображення", "*.png *.jpg *.jpeg *.webp"),
@@ -2286,37 +2770,96 @@ class App(ctk.CTk, *_DND_BASES):
             self.events.put(("detected", {"found": found}))
         threading.Thread(target=job, daemon=True).start()
 
-    def _show_preview(self, items: list[tuple[str, str]], total: int):
+    def _show_preview(self, items: list[tuple[str, str]], total: int, compare: dict | None = None,
+                      notes: list[str] | None = None):
         try:
-            from PIL import Image
+            from PIL import Image, ImageDraw
         except ImportError:
             messagebox.showerror(APP_TITLE, "Для превʼю потрібна бібліотека Pillow:\npip install pillow")
             return
         win = ctk.CTkToplevel(self)
         win.title(f"Превʼю — {Path(self.sources[0]).name} (seed {self.seed_var.get()})")
-        win.geometry("1080x760")
-        frame = ctk.CTkScrollableFrame(win)
-        frame.pack(fill="both", expand=True, padx=10, pady=10)
+        win.geometry("1100x820")
+        tabs = ctk.CTkTabview(win, segmented_button_selected_color=SEG_SELECTED,
+                              segmented_button_selected_hover_color=SEG_SELECTED_HOVER, text_color=SEG_TEXT)
+        tabs.pack(fill="both", expand=True, padx=10, pady=(4, 0))
+        self._preview_images = []
+
+        cmp_ok = bool(compare and compare.get("before") and compare.get("afters"))
+        if cmp_ok:
+            t_cmp = tabs.add("До / після")
+            before = Image.open(compare["before"]).convert("RGB")
+            afters = {label: path for label, path in compare["afters"]}
+            box_h = 560
+            k = min(box_h / before.height, 900 / before.width)
+            size = (max(2, int(before.width * k)), max(2, int(before.height * k)))
+            b_img = before.resize(size, Image.LANCZOS)
+            state = {"after": None}
+            ctrl = ctk.CTkFrame(t_cmp, fg_color="transparent")
+            ctrl.pack(fill="x", pady=(2, 4))
+            ctk.CTkLabel(ctrl, text="Порівняти оригінал з:").pack(side="left", padx=(4, 6))
+            choice = ctk.StringVar(value=next(iter(afters)))
+            pos = ctk.DoubleVar(value=0.5)
+            label = ctk.CTkLabel(t_cmp, text="")
+
+            def render(*_):
+                a = state["after"]
+                if a is None:
+                    return
+                x = int(size[0] * pos.get())
+                img = a.copy()
+                img.paste(b_img.crop((0, 0, x, size[1])), (0, 0))
+                d = ImageDraw.Draw(img)
+                d.rectangle([x - 1, 0, x + 1, size[1]], fill=(255, 255, 255))
+                for txt, tx in (("ДО", 10), ("ПІСЛЯ", size[0] - 70)):
+                    d.rectangle([tx - 4, 8, tx + 60, 30], fill=(0, 0, 0))
+                    d.text((tx, 12), txt, fill=(255, 255, 255))
+                cimg = ctk.CTkImage(light_image=img, dark_image=img, size=size)
+                self._preview_images.append(cimg)
+                self._preview_images = self._preview_images[-40:]
+                label.configure(image=cimg)
+
+            def pick(*_):
+                state["after"] = Image.open(afters[choice.get()]).convert("RGB").resize(size, Image.LANCZOS)
+                render()
+            ctk.CTkOptionMenu(ctrl, values=list(afters), variable=choice, width=200,
+                              command=lambda _v: pick()).pack(side="left")
+            ctk.CTkLabel(ctrl, text="   тягніть повзунок, щоб порівняти ліву й праву частини",
+                         text_color=HINT).pack(side="left")
+            label.pack(pady=4)
+            ctk.CTkSlider(t_cmp, from_=0, to=1, number_of_steps=200, variable=pos, width=size[0],
+                          command=lambda _v: render()).pack(pady=(0, 6))
+            pick()
+
+        t_grid = tabs.add("Усі варіації")
+        frame = ctk.CTkScrollableFrame(t_grid)
+        frame.pack(fill="both", expand=True)
         cols = 3
         for c in range(cols):
             frame.grid_columnconfigure(c, weight=1)
-        self._preview_images = []
         for n, (path, caption) in enumerate(items):
             img = Image.open(path)
             img.load()
             w = 330
             h = max(1, int(img.height * w / img.width))
+            if h > 520:
+                h = 520
+                w = max(1, int(img.width * h / img.height))
             cimg = ctk.CTkImage(light_image=img, dark_image=img, size=(w, h))
             self._preview_images.append(cimg)
             cell = ctk.CTkFrame(frame)
             cell.grid(row=n // cols, column=n % cols, padx=6, pady=6, sticky="n")
             ctk.CTkLabel(cell, image=cimg, text="").pack(padx=6, pady=(6, 2))
-            ctk.CTkLabel(cell, text=caption, wraplength=w, justify="left",
-                         font=ctk.CTkFont(size=11, weight="bold" if n == 0 else "normal")
+            ctk.CTkLabel(cell, text=caption, wraplength=330, justify="left",
+                         font=ctk.CTkFont(size=11, weight="bold" if n < 2 else "normal")
                          ).pack(padx=6, pady=(0, 6), anchor="w")
-        note = (f"Показано {len(items) - 1} з {total} варіацій. "
+        shown = sum(1 for _, c in items if c.startswith("#"))
+        note = (f"Показано {shown} з {total} варіацій. "
                 "Натисніть «▶ Старт» з тим самим seed — отримаєте саме ці варіації.")
-        ctk.CTkLabel(win, text=note, text_color=HINT).pack(pady=(0, 10))
+        if notes:
+            note += "\n" + " • ".join(notes)
+        ctk.CTkLabel(win, text=note, text_color=HINT, wraplength=1040).pack(pady=(4, 10))
+        tabs.set("До / після" if cmp_ok else "Усі варіації")
         win.after(150, win.lift)
         win.focus()
 
@@ -2346,7 +2889,13 @@ class App(ctk.CTk, *_DND_BASES):
                                          "\nСтара версія залишилась без змін.")
                 elif kind == "preview":
                     self.status.configure(text="Превʼю готове")
-                    self._show_preview(data["items"], data["total"])
+                    self._show_preview(data["items"], data["total"], data.get("compare"), data.get("notes"))
+                elif kind == "comp_done":
+                    self._installing.discard(data["name"])
+                    self._refresh_comp(data["name"])
+                    self.status.configure(text="Компонент встановлено ✔" if data["ok"]
+                                          else "Не вдалося встановити — деталі в журналі")
+                    self.progress.set(1 if data["ok"] else 0)
                 elif kind == "preview_done":
                     self.preview_worker = None
                     self._set_busy(False)
@@ -2362,6 +2911,7 @@ class App(ctk.CTk, *_DND_BASES):
                 elif kind == "done":
                     self.worker = None
                     self._set_busy(False)
+                    self._update_cache_label()
                     if data["stopped"]:
                         self.status.configure(text="Зупинено користувачем")
                         self._append_log("— Зупинено —")
