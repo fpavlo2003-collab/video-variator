@@ -45,7 +45,7 @@ try:  # розширені покращення (кадрування, субт�
 except Exception:  # noqa: BLE001
     ai = None
 
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.3.1"
 APP_TITLE = "Video Variator " + ".".join(APP_VERSION.split(".")[:2])
 UPDATE_REPO = "fpavlo2003-collab/video-variator"
 UPDATE_BRANCH = "main"
@@ -314,15 +314,35 @@ _FILTER_CACHE: dict[str, set] = {}
 
 
 def has_filter(ffmpeg: str, name: str) -> bool:
+    """Чи є фільтр у цьому FFmpeg (стійко до різних форматів виводу -filters у нових версіях)."""
+    import re
     if ffmpeg not in _FILTER_CACHE:
+        names: set = set()
         try:
             r = subprocess.run([ffmpeg, "-hide_banner", "-filters"], capture_output=True, text=True,
                                encoding="utf-8", errors="replace", creationflags=_NO_WINDOW)
-            _FILTER_CACHE[ffmpeg] = {ln.split()[1] for ln in r.stdout.splitlines()
-                                     if len(ln.split()) > 2 and len(ln.split()[0]) == 3}
+            for ln in (r.stdout + r.stderr).splitlines():
+                tok = ln.split()
+                if len(tok) >= 3 and re.fullmatch(r"[.A-Z|]{2,6}", tok[0]) and "->" in ln:
+                    names.add(tok[1])
         except OSError:
-            _FILTER_CACHE[ffmpeg] = set()
-    return name in _FILTER_CACHE[ffmpeg]
+            pass
+        _FILTER_CACHE[ffmpeg] = names
+    known = _FILTER_CACHE[ffmpeg]
+    if name in known:
+        return True
+    key = f"{ffmpeg}|?{name}"
+    if key not in _FILTER_CACHE:   # запасна перевірка напряму
+        ok = False
+        try:
+            r = subprocess.run([ffmpeg, "-hide_banner", "-h", f"filter={name}"], capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=15, creationflags=_NO_WINDOW)
+            out = (r.stdout + r.stderr).lower()
+            ok = r.returncode == 0 and f"filter {name}" in out and "unknown filter" not in out
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        _FILTER_CACHE[key] = {name} if ok else set()
+    return bool(_FILTER_CACHE[key])
 
 
 def target_size(info: MediaInfo, res_label: str) -> tuple[int, int]:
@@ -2318,9 +2338,9 @@ class App(ctk.CTk, *_DND_BASES):
         rf.grid(row=r, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 4))
         ctk.CTkSwitch(rf, text="Розумне кадрування", variable=self.reframe_var,
                       font=ctk.CTkFont(weight="bold")).pack(side="left", padx=10, pady=8)
-        ctk.CTkLabel(rf, text="замість розмитого фону кадр заповнює весь екран, а «камера» стежить "
-                              "за обличчям / людиною", text_color=HINT).pack(side="left")
         self._comp_button(rf, "opencv").pack(side="right", padx=10)
+        ctk.CTkLabel(rf, text="кадр на весь екран, «камера» стежить за людиною", text_color=HINT
+                     ).pack(side="left")
 
         r += 1
         wm = ctk.CTkFrame(tab)
@@ -2385,9 +2405,9 @@ class App(ctk.CTk, *_DND_BASES):
         top.pack(fill="x", padx=10, pady=(8, 2))
         ctk.CTkSwitch(top, text="Автосубтитри", variable=self.subs_var,
                       font=ctk.CTkFont(weight="bold")).pack(side="left")
-        ctk.CTkLabel(top, text="  програма сама розпізнає мову (без інтернету) і накладає текст як у CapCut",
-                     text_color=HINT).pack(side="left")
         self._comp_button(top, "whisper").pack(side="right")
+        ctk.CTkLabel(top, text="  мова розпізнається сама, текст як у CapCut",
+                     text_color=HINT).pack(side="left")
         A = ai
         r1 = ctk.CTkFrame(sb, fg_color="transparent")
         r1.pack(fill="x", padx=10, pady=4)
@@ -2773,7 +2793,7 @@ class App(ctk.CTk, *_DND_BASES):
     def _show_preview(self, items: list[tuple[str, str]], total: int, compare: dict | None = None,
                       notes: list[str] | None = None):
         try:
-            from PIL import Image, ImageDraw
+            from PIL import Image, ImageDraw, ImageFont
         except ImportError:
             messagebox.showerror(APP_TITLE, "Для превʼю потрібна бібліотека Pillow:\npip install pillow")
             return
@@ -2795,6 +2815,10 @@ class App(ctk.CTk, *_DND_BASES):
             size = (max(2, int(before.width * k)), max(2, int(before.height * k)))
             b_img = before.resize(size, Image.LANCZOS)
             state = {"after": None}
+            try:
+                lbl_font = ImageFont.truetype(find_font() or resolve_font("Arial Bold") or "arial.ttf", 16)
+            except Exception:  # noqa: BLE001
+                lbl_font = ImageFont.load_default()
             ctrl = ctk.CTkFrame(t_cmp, fg_color="transparent")
             ctrl.pack(fill="x", pady=(2, 4))
             ctk.CTkLabel(ctrl, text="Порівняти оригінал з:").pack(side="left", padx=(4, 6))
@@ -2811,9 +2835,11 @@ class App(ctk.CTk, *_DND_BASES):
                 img.paste(b_img.crop((0, 0, x, size[1])), (0, 0))
                 d = ImageDraw.Draw(img)
                 d.rectangle([x - 1, 0, x + 1, size[1]], fill=(255, 255, 255))
-                for txt, tx in (("ДО", 10), ("ПІСЛЯ", size[0] - 70)):
-                    d.rectangle([tx - 4, 8, tx + 60, 30], fill=(0, 0, 0))
-                    d.text((tx, 12), txt, fill=(255, 255, 255))
+                for txt, right in (("ДО", False), ("ПІСЛЯ", True)):
+                    tw = int(d.textlength(txt, font=lbl_font))
+                    tx = size[0] - tw - 14 if right else 10
+                    d.rounded_rectangle([tx - 6, 8, tx + tw + 6, 32], radius=6, fill=(0, 0, 0))
+                    d.text((tx, 11), txt, fill=(255, 255, 255), font=lbl_font)
                 cimg = ctk.CTkImage(light_image=img, dark_image=img, size=size)
                 self._preview_images.append(cimg)
                 self._preview_images = self._preview_images[-40:]

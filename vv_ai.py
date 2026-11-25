@@ -410,10 +410,16 @@ class _FaceFinder:
         if self.yunet is None:
             try:
                 self.haar = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+                if self.haar.empty():
+                    self.haar = None
             except Exception:  # noqa: BLE001
                 self.haar = None
-        self.hog = cv2.HOGDescriptor()
-        self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        self.hog = None
+        try:  # у OpenCV 5.x HOG може бути відсутній — тоді шукаємо лише обличчя та рух
+            self.hog = cv2.HOGDescriptor()
+            self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        except Exception:  # noqa: BLE001
+            self.hog = None
 
     def faces(self, img, gray) -> list[tuple[float, float, float, float, float]]:
         out = []
@@ -431,6 +437,8 @@ class _FaceFinder:
         return out
 
     def people(self, img) -> list[tuple[float, float, float, float]]:
+        if self.hog is None:
+            return []
         try:
             rects, weights = self.hog.detectMultiScale(img, winStride=(8, 8), padding=(8, 8), scale=1.06)
         except Exception:  # noqa: BLE001
