@@ -45,7 +45,7 @@ try:  # розширені покращення (кадрування, субт�
 except Exception:  # noqa: BLE001
     ai = None
 
-APP_VERSION = "3.3.1"
+APP_VERSION = "3.4.0"
 APP_TITLE = "Video Variator " + ".".join(APP_VERSION.split(".")[:2])
 UPDATE_REPO = "fpavlo2003-collab/video-variator"
 UPDATE_BRANCH = "main"
@@ -66,6 +66,11 @@ RANGE_KEYS = ("color_min", "color_max", "bright_min", "bright_max", "hue_max",
               "zoom_min", "zoom_max", "grain_min", "grain_max", "tempo_min", "tempo_max")
 BITRATE_MODES = ["Якість (CRF)", "Фіксований бітрейт"]
 AUDIO_BITRATES = ["128k", "160k", "192k", "256k"]
+RANDOM_AUDIO_BITRATES = ["128k", "160k", "192k"]   # з них обирається випадково для кожної варіації
+# числові поля «випадкового кодування» та «випадкової обрізки» (у вкладці «Експорт»)
+ENC_KEYS = ("crf_min", "crf_max", "gop_min", "gop_max", "mbps_min", "mbps_max", "mbps_jitter",
+            "trim_rand_min", "trim_rand_max")
+ENC_INT_KEYS = ("crf_min", "crf_max", "gop_min", "gop_max")
 HOOK_POSITIONS = ["Зверху", "По центру", "Знизу"]
 HOOK_STYLES = ["Темна плашка", "Біла плашка", "Обводка без плашки"]
 FONT_LIBRARY = [  # (назва, файли-кандидати)
@@ -443,6 +448,19 @@ class Options:
     trim_enabled: bool = False
     trim_start: float = 0.0     # секунд прибрати з початку
     trim_end: float = 0.0       # секунд прибрати з кінця
+    trim_random: bool = False   # випадкова обрізка для кожної варіації замість фіксованої
+    trim_rand_min: float = 0.05  # діапазон випадкової обрізки (і початку, і кінця), секунд
+    trim_rand_max: float = 0.25
+    # випадкові параметри кодування для кожної варіації (A/B-тест ваги та якості)
+    enc_random: bool = False
+    crf_min: int = 20           # діапазон CRF/CQ
+    crf_max: int = 23
+    gop_min: int = 30           # інтервал ключових кадрів -g, кадрів
+    gop_max: int = 60
+    mbps_min: float = 4.0       # діапазон відеобітрейту, Мбіт/с (у режимі CRF — стеля, у фіксованому — ціль)
+    mbps_max: float = 8.0
+    mbps_jitter: float = 10.0   # випадкове відхилення бітрейту ±%, у межах діапазону
+    abr_random: bool = False    # випадковий бітрейт звуку з RANDOM_AUDIO_BITRATES
     bitrate_mode: str = "Якість (CRF)"
     video_mbps: float = 8.0
     audio_bitrate: str = "192k"
@@ -522,6 +540,12 @@ class Variation:
     hflip: bool = False
     hue: float | None = None
     metadata_stripped: bool = False
+    trim_start: float | None = None
+    trim_end: float | None = None
+    crf: int | None = None
+    gop: int | None = None
+    mbps: float | None = None
+    audio_bitrate: str | None = None
 
     def signature(self) -> tuple:
         d = asdict(self)
@@ -547,6 +571,12 @@ class Variation:
             parts.append(f"темп ×{self.tempo:.3f}")
         if self.hflip:
             parts.append("дзеркало")
+        if self.trim_start is not None:
+            parts.append(f"обрізка {self.trim_start:.2f}/{self.trim_end or 0:.2f} с")
+        if self.crf is not None:
+            parts.append(f"CRF {self.crf}, GOP {self.gop}, {self.mbps} Мбіт/с")
+        if self.audio_bitrate:
+            parts.append(f"звук {self.audio_bitrate}")
         return "; ".join(parts) or "без візуальних змін"
 
 
@@ -620,6 +650,23 @@ def make_variation(index: int, opt: Options, info: MediaInfo, rng: random.Random
 
     if opt.hflip:
         var.hflip = rng.random() < 0.5
+
+    # нові випадкові параметри — після старих, щоб той самий seed давав ті самі ефекти, що й раніше
+    if opt.trim_enabled and opt.trim_random:
+        a0, a1 = _span(opt.trim_rand_min, opt.trim_rand_max, 0, 5)
+        var.trim_start = round(rng.uniform(a0, a1), 3)
+        var.trim_end = round(rng.uniform(a0, a1), 3)
+    if opt.enc_random:
+        c0, c1 = _span(opt.crf_min, opt.crf_max, 0, 51)
+        var.crf = rng.randint(int(c0), int(c1))
+        g0, g1 = _span(opt.gop_min, opt.gop_max, 1, 600)
+        var.gop = rng.randint(int(g0), int(g1))
+        m0, m1 = _span(opt.mbps_min, opt.mbps_max, 0.5, 100)
+        j = max(0.0, min(50.0, float(opt.mbps_jitter))) / 100
+        mbps = rng.uniform(m0, m1) * (1 + rng.uniform(-j, j))
+        var.mbps = round(min(m1, max(m0, mbps)), 2)
+    if opt.abr_random:
+        var.audio_bitrate = rng.choice(RANDOM_AUDIO_BITRATES)
     return var
 
 
@@ -1011,12 +1058,17 @@ def build_graph(var: Variation, info: MediaInfo, opt: Options, pix_fmt: str = "y
     return ";".join(parts), extra_inputs, (",".join(af) or None)
 
 
-def trim_window(info: MediaInfo, opt: Options) -> tuple[float, float]:
-    """(початок, тривалість вихідного шматка в секундах вихідника). Без обрізки — (0, повна тривалість)."""
-    if not opt.trim_enabled or info.duration <= 0:
+def trim_window(info: MediaInfo, opt: Options, var: Variation | None = None) -> tuple[float, float]:
+    """(початок, тривалість вихідного шматка в секундах вихідника). Без обрізки — (0, повна тривалість).
+    Випадкова обрізка береться з варіації; без неї (аналіз, AI-підготовка) — повне відео."""
+    if info.duration <= 0:
         return 0.0, info.duration
-    a = max(0.0, float(opt.trim_start))
-    b = max(0.0, float(opt.trim_end))
+    if var is not None and var.trim_start is not None:
+        a, b = max(0.0, var.trim_start), max(0.0, var.trim_end or 0.0)
+    elif opt.trim_enabled and not opt.trim_random:
+        a, b = max(0.0, float(opt.trim_start)), max(0.0, float(opt.trim_end))
+    else:
+        return 0.0, info.duration
     if info.duration - a - b < 0.5:   # щоб не обрізати відео «в нуль»
         return 0.0, info.duration
     return a, info.duration - a - b
@@ -1028,7 +1080,7 @@ def build_command(ffmpeg: str, src: str, dst: str, var: Variation, info: MediaIn
     fc, extra, af = build_graph(var, info, opt, encoder_pix_fmt(encoder),
                                 tonemap=has_filter(ffmpeg, "zscale"), assets=assets,
                                 has_cas=has_filter(ffmpeg, "cas"))
-    t0, tlen = trim_window(info, opt)
+    t0, tlen = trim_window(info, opt, var)
     cmd = [ffmpeg, "-hide_banner", "-nostdin", "-y"]
     if t0 > 0:
         cmd += ["-ss", f"{t0:.3f}"]
@@ -1042,16 +1094,24 @@ def build_command(ffmpeg: str, src: str, dst: str, var: Variation, info: MediaIn
         cmd += ["-map_metadata", "-1", "-map_chapters", "-1",
                 "-fflags", "+bitexact", "-flags:v", "+bitexact", "-flags:a", "+bitexact"]
     fixed = opt.bitrate_mode == "Фіксований бітрейт"
-    mbps = max(0.5, min(100.0, float(opt.video_mbps))) if fixed else None
-    cmd += encoder_args(encoder, opt.crf, opt.x264_preset, mbps)
-    if opt.trim_enabled and tlen < info.duration:
+    crf = var.crf if var.crf is not None else opt.crf
+    mbps = None
+    if fixed:
+        mbps = var.mbps if var.mbps is not None else max(0.5, min(100.0, float(opt.video_mbps)))
+    cmd += encoder_args(encoder, crf, opt.x264_preset, mbps)
+    if var.gop:
+        cmd += ["-g", str(var.gop)]
+    if tlen < info.duration:
         cmd += ["-t", f"{tlen / (var.tempo or 1.0):.3f}"]
-    if opt.bitrate_cap and not fixed:
-        cmd += bitrate_cap_args(info, opt)
+    if not fixed:
+        if var.mbps is not None:   # випадковий бітрейт у режимі CRF — стеля для якості
+            cmd += ["-maxrate", f"{var.mbps:.2f}M", "-bufsize", f"{var.mbps * 2:.2f}M"]
+        elif opt.bitrate_cap:
+            cmd += bitrate_cap_args(info, opt)
     cmd += ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"] \
         if (info.hdr or info.height >= 720) else []
     if info.has_audio:
-        ab = opt.audio_bitrate if opt.audio_bitrate in AUDIO_BITRATES else "192k"
+        ab = var.audio_bitrate or (opt.audio_bitrate if opt.audio_bitrate in AUDIO_BITRATES else "192k")
         cmd += ["-c:a", "aac", "-b:a", ab]
     if dst.lower().endswith((".mp4", ".mov", ".m4v")):
         cmd += ["-movflags", "+faststart"]
@@ -1311,7 +1371,7 @@ class BatchWorker(threading.Thread):
         assets = assets_for_source(job.assets if job.assets is not None else self.assets, opt, job.info,
                                    self.assets_dir)
         cmd = build_command(self.ffmpeg, job.src, job.dst, job.var, job.info, opt, assets)
-        out_dur = trim_window(job.info, opt)[1] / (job.var.tempo or 1.0)
+        out_dur = trim_window(job.info, opt, job.var)[1] / (job.var.tempo or 1.0)
         ok, err = self._encode(cmd, i, out_dur)
         if self._stop_evt.is_set():
             try:
@@ -1597,7 +1657,9 @@ class App(ctk.CTk, *_DND_BASES):
 
         self.bool_vars = {k: ctk.BooleanVar(value=getattr(o, k)) for k in
                           ("strip_metadata", "color", "zoom_border", "grain", "tempo",
-                           "hflip", "randomize_set", "use_styles")}
+                           "hflip", "randomize_set", "use_styles",
+                           "trim_random", "enc_random", "abr_random")}
+        self.enc_vars = {k: ctk.StringVar(value=f"{getattr(o, k):g}") for k in ENC_KEYS}
         self.zoom_mode_var = ctk.StringVar(value=o.zoom_mode)
         self.range_vars = {k: ctk.StringVar(value=f"{getattr(o, k):g}") for k in RANGE_KEYS}
         self.chance_var = ctk.DoubleVar(value=o.effect_chance)
@@ -1744,6 +1806,7 @@ class App(ctk.CTk, *_DND_BASES):
             audio_bitrate=self.abr_var.get(),
             effect_chance=round(float(self.chance_var.get()), 2),
             **self._ranges(),
+            **self._enc_values(),
             aspect=self.aspect_var.get(),
             wm_enabled=self.wm_enabled_var.get(),
             wm_type=self.wm_type_var.get(),
@@ -1806,6 +1869,14 @@ class App(ctk.CTk, *_DND_BASES):
             out[k] = int(round(v)) if k.startswith("grain") else round(v, 2)
         return out
 
+    def _enc_values(self) -> dict:
+        d = Options()
+        out = {}
+        for k in ENC_KEYS:
+            v = self._num(self.enc_vars[k].get(), getattr(d, k), 0.0, 1000.0)
+            out[k] = int(round(v)) if k in ENC_INT_KEYS else round(v, 3)
+        return out
+
     @staticmethod
     def _float(v, default: float) -> float:
         try:
@@ -1819,6 +1890,8 @@ class App(ctk.CTk, *_DND_BASES):
         self.zoom_mode_var.set(o.zoom_mode)
         for k in RANGE_KEYS:
             self.range_vars[k].set(f"{getattr(o, k):g}")
+        for k in ENC_KEYS:
+            self.enc_vars[k].set(f"{getattr(o, k):g}")
         self.chance_var.set(o.effect_chance)
         self.chance_label.configure(text=f"{o.effect_chance:.0%}")
         self.border_mode_var.set(o.border_color_mode)
@@ -2322,6 +2395,53 @@ class App(ctk.CTk, *_DND_BASES):
         ctk.CTkLabel(tf, text="з кінця, с:").pack(side="left", padx=(14, 4))
         ctk.CTkEntry(tf, textvariable=self.trim_end_var, width=60).pack(side="left")
         ctk.CTkLabel(tf, text="  однаково для всіх файлів, напр. 0.25", text_color=HINT).pack(side="left")
+
+        def entry(parent, key, w=56):
+            ctk.CTkEntry(parent, textvariable=self.enc_vars[key], width=w).pack(side="left")
+
+        def label(parent, text, hint=False, pad=(10, 4)):
+            ctk.CTkLabel(parent, text=text, text_color=HINT if hint else None).pack(side="left", padx=pad)
+
+        tr = ctk.CTkFrame(tab)
+        tr.grid(row=10, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 6))
+        ctk.CTkCheckBox(tr, text="Випадкова обрізка", variable=self.bool_vars["trim_random"]
+                        ).pack(side="left", padx=10, pady=10)
+        label(tr, "від, с:")
+        entry(tr, "trim_rand_min")
+        label(tr, "до, с:", pad=(14, 4))
+        entry(tr, "trim_rand_max")
+        label(tr, "  окремо для початку й кінця кожної варіації (потрібен перемикач «Обрізка»)", hint=True)
+
+        er = ctk.CTkFrame(tab)
+        er.grid(row=11, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 10))
+        top = ctk.CTkFrame(er, fg_color="transparent")
+        top.pack(fill="x", padx=10, pady=(10, 4))
+        ctk.CTkSwitch(top, text="Випадкові параметри кодування", variable=self.bool_vars["enc_random"],
+                      font=ctk.CTkFont(weight="bold")).pack(side="left")
+        label(top, "  для кожної варіації свої — порівнюйте вагу/якість у CSV-звіті", hint=True)
+        row = ctk.CTkFrame(er, fg_color="transparent")
+        row.pack(fill="x", padx=10, pady=4)
+        label(row, "CRF від", pad=(0, 4))
+        entry(row, "crf_min", 44)
+        label(row, "до", pad=(6, 4))
+        entry(row, "crf_max", 44)
+        label(row, "GOP (-g) від", pad=(18, 4))
+        entry(row, "gop_min", 50)
+        label(row, "до", pad=(6, 4))
+        entry(row, "gop_max", 50)
+        label(row, "кадрів", hint=True, pad=(6, 0))
+        row2 = ctk.CTkFrame(er, fg_color="transparent")
+        row2.pack(fill="x", padx=10, pady=(4, 6))
+        label(row2, "Бітрейт від", pad=(0, 4))
+        entry(row2, "mbps_min", 50)
+        label(row2, "до", pad=(6, 4))
+        entry(row2, "mbps_max", 50)
+        label(row2, "Мбіт/с, відхилення ±", pad=(6, 4))
+        entry(row2, "mbps_jitter", 44)
+        label(row2, "%", pad=(4, 0))
+        label(row2, "  у режимі CRF — стеля, у фіксованому — ціль", hint=True)
+        ctk.CTkCheckBox(er, text="Випадковий бітрейт звуку (128k / 160k / 192k)",
+                        variable=self.bool_vars["abr_random"]).pack(anchor="w", padx=10, pady=(4, 10))
 
     def _tab_design(self, tab):
         tab = self._scrollable(tab)
