@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Video Variator 2.0 — пакетна генерація візуальних варіацій відео
+Video Variator 3 — пакетна генерація візуальних варіацій відео
 для A/B-тестування стилів монтажу. Інтерфейс: CustomTkinter, обробка: FFmpeg.
 
 Можливості:
@@ -39,7 +39,7 @@ from tkinter import filedialog, messagebox, colorchooser
 
 import customtkinter as ctk
 
-APP_VERSION = "3.0.1"
+APP_VERSION = "3.1.0"
 APP_TITLE = "Video Variator " + ".".join(APP_VERSION.split(".")[:2])
 UPDATE_REPO = "fpavlo2003-collab/video-variator"
 UPDATE_BRANCH = "main"
@@ -56,6 +56,8 @@ ZOOM_MODES = ["Випадково", "Тільки зум", "Тільки рам�
 ASPECTS = {"Як в оригіналі": None, "9:16 (Reels / TikTok)": (9, 16), "1:1 (квадрат)": (1, 1),
            "4:5 (пост Instagram)": (4, 5), "16:9 (YouTube)": (16, 9)}
 WM_TYPES = ["Логотип", "Текст"]
+RANGE_KEYS = ("color_min", "color_max", "bright_min", "bright_max", "hue_max",
+              "zoom_min", "zoom_max", "grain_min", "grain_max", "tempo_min", "tempo_max")
 HOOK_POSITIONS = ["Зверху", "По центру", "Знизу"]
 HOOK_STYLES = ["Темна плашка", "Біла плашка", "Обводка без плашки"]
 FONT_LIBRARY = [  # (назва, файли-кандидати)
@@ -382,6 +384,18 @@ class Options:
     hflip: bool = False
     randomize_set: bool = True
     effect_chance: float = 0.65
+    # діапазони ефектів (задаються в інтерфейсі)
+    color_min: float = 3.0      # контраст/насиченість, %
+    color_max: float = 5.0
+    bright_min: float = 1.0     # яскравість, %
+    bright_max: float = 4.0
+    hue_max: float = 0.0        # зсув відтінку, градуси (0 = вимкнено)
+    zoom_min: float = 1.0       # мікрозум/кроп, %
+    zoom_max: float = 3.0
+    grain_min: int = 3          # сила зерна
+    grain_max: int = 7
+    tempo_min: float = -2.0     # темп, %
+    tempo_max: float = 3.0
     use_styles: bool = False
     styles: list = field(default_factory=lambda: ["Теплий", "Холодний", "Кіно (teal & orange)"])
     style_strength: float = 0.6
@@ -435,6 +449,7 @@ class Variation:
     grain: int | None = None
     tempo: float | None = None
     hflip: bool = False
+    hue: float | None = None
     metadata_stripped: bool = False
 
     def signature(self) -> tuple:
@@ -449,6 +464,8 @@ class Variation:
         if self.brightness is not None:
             parts.append(f"яскр {self.brightness:+.3f}, контр ×{self.contrast:.3f}, "
                          f"насич ×{self.saturation:.3f}")
+        if self.hue is not None:
+            parts.append(f"відтінок {self.hue:+.1f}°")
         if self.zoom is not None:
             parts.append(f"зум ×{self.zoom:.3f}")
         if self.border_px is not None:
@@ -460,6 +477,12 @@ class Variation:
         if self.hflip:
             parts.append("дзеркало")
         return "; ".join(parts) or "без візуальних змін"
+
+
+def _span(a: float, b: float, lo: float, hi: float) -> tuple[float, float]:
+    """Впорядковує й обмежує діапазон від/до розумними межами."""
+    a, b = max(lo, min(hi, float(a))), max(lo, min(hi, float(b)))
+    return (a, b) if a <= b else (b, a)
 
 
 def _signed(rng: random.Random, lo: float, hi: float) -> float:
@@ -485,16 +508,22 @@ def make_variation(index: int, opt: Options, info: MediaInfo, rng: random.Random
         flags[rng.choice(enabled)] = True
 
     if flags["color"]:
-        var.brightness = round(_signed(rng, 0.01, 0.04), 4)
-        var.contrast = round(1 + _signed(rng, 0.03, 0.05), 4)
-        var.saturation = round(1 + _signed(rng, 0.03, 0.05), 4)
+        b0, b1 = _span(opt.bright_min, opt.bright_max, 0, 10)
+        c0, c1 = _span(opt.color_min, opt.color_max, 0, 15)
+        var.brightness = round(_signed(rng, b0 / 100, b1 / 100), 4)
+        var.contrast = round(1 + _signed(rng, c0 / 100, c1 / 100), 4)
+        var.saturation = round(1 + _signed(rng, c0 / 100, c1 / 100), 4)
+        h1 = max(0.0, min(15.0, float(opt.hue_max)))
+        if h1 > 0:
+            var.hue = round(rng.uniform(-h1, h1), 2)
 
     if flags["zoom_border"]:
         mode = opt.zoom_mode
         if mode == "Випадково":
             mode = rng.choice(["Тільки зум", "Тільки рамка"])
         if mode == "Тільки зум":
-            var.zoom = round(rng.uniform(1.01, 1.03), 4)
+            z0, z1 = _span(opt.zoom_min, opt.zoom_max, 0.2, 10)
+            var.zoom = round(1 + rng.uniform(z0, z1) / 100, 4)
             var.zoom_x = round(rng.random(), 3)
             var.zoom_y = round(rng.random(), 3)
         else:
@@ -504,13 +533,19 @@ def make_variation(index: int, opt: Options, info: MediaInfo, rng: random.Random
                                 else rng.choice(BORDER_COLORS))
 
     if flags["grain"]:
-        var.grain = rng.randint(3, 7)
+        g0, g1 = _span(opt.grain_min, opt.grain_max, 1, 25)
+        var.grain = rng.randint(int(g0), int(g1))
 
     if flags["tempo"]:
-        t = 1.0
-        while abs(t - 1.0) < 0.005:
-            t = rng.uniform(0.98, 1.03)
-        var.tempo = round(t, 4)
+        t0, t1 = _span(opt.tempo_min, opt.tempo_max, -10, 10)
+        if not (t0 == 0 and t1 == 0):
+            t = 1.0
+            for _ in range(50):
+                t = 1 + rng.uniform(t0, t1) / 100
+                if abs(t - 1.0) >= 0.003:
+                    break
+            if abs(t - 1.0) >= 0.001:
+                var.tempo = round(t, 4)
 
     if opt.hflip:
         var.hflip = rng.random() < 0.5
@@ -786,6 +821,8 @@ def build_graph(var: Variation, info: MediaInfo, opt: Options, pix_fmt: str = "y
         post += STYLE_PRESETS[var.style](var.style_strength or 0.6)
     if var.brightness is not None:
         post.append(f"eq=brightness={var.brightness}:contrast={var.contrast}:saturation={var.saturation}")
+    if var.hue is not None:
+        post.append(f"hue=h={var.hue}")
     if assets.get("lut"):
         post.append("lut3d=file=lut.cube:interp=tetrahedral")
     if opt.sharpen:
@@ -1257,6 +1294,8 @@ class App(ctk.CTk, *_DND_BASES):
                           ("strip_metadata", "color", "zoom_border", "grain", "tempo",
                            "hflip", "randomize_set", "use_styles")}
         self.zoom_mode_var = ctk.StringVar(value=o.zoom_mode)
+        self.range_vars = {k: ctk.StringVar(value=f"{getattr(o, k):g}") for k in RANGE_KEYS}
+        self.chance_var = ctk.DoubleVar(value=o.effect_chance)
         self.border_mode_var = ctk.StringVar(value=o.border_color_mode)
         self.border_color = o.border_color
         self.style_vars = {name: ctk.BooleanVar(value=name in o.styles) for name in STYLE_PRESETS}
@@ -1357,6 +1396,8 @@ class App(ctk.CTk, *_DND_BASES):
             resolution=self.res_var.get(),
             fps=self.fps_var.get(),
             bitrate_cap=self.cap_var.get(),
+            effect_chance=round(float(self.chance_var.get()), 2),
+            **self._ranges(),
             aspect=self.aspect_var.get(),
             wm_enabled=self.wm_enabled_var.get(),
             wm_type=self.wm_type_var.get(),
@@ -1381,6 +1422,17 @@ class App(ctk.CTk, *_DND_BASES):
             lut_file=self.lut_file_var.get().strip(),
         )
 
+    def _ranges(self) -> dict:
+        d = Options()
+        out = {}
+        for k in RANGE_KEYS:
+            try:
+                v = float(str(self.range_vars[k].get()).replace(",", ".").replace("+", ""))
+            except ValueError:
+                v = getattr(d, k)
+            out[k] = int(round(v)) if k.startswith("grain") else round(v, 2)
+        return out
+
     @staticmethod
     def _float(v, default: float) -> float:
         try:
@@ -1392,6 +1444,10 @@ class App(ctk.CTk, *_DND_BASES):
         for k, var in self.bool_vars.items():
             var.set(getattr(o, k))
         self.zoom_mode_var.set(o.zoom_mode)
+        for k in RANGE_KEYS:
+            self.range_vars[k].set(f"{getattr(o, k):g}")
+        self.chance_var.set(o.effect_chance)
+        self.chance_label.configure(text=f"{o.effect_chance:.0%}")
         self.border_mode_var.set(o.border_color_mode)
         self.border_color = o.border_color
         try:
@@ -1693,23 +1749,35 @@ class App(ctk.CTk, *_DND_BASES):
         ctk.CTkLabel(row, text="  той самий seed = ті самі варіації", text_color=HINT
                      ).pack(side="left")
 
+    @staticmethod
+    def _scrollable(tab):
+        sf = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        sf.pack(fill="both", expand=True)
+        return sf
+
     def _tab_effects(self, tab):
+        tab = self._scrollable(tab)
         tab.grid_columnconfigure((0, 1), weight=1)
         items = [
             ("strip_metadata", "Очищення метаданих (-map_metadata -1)"),
-            ("color", "Яскравість / контраст / насиченість (±3–5%)"),
-            ("zoom_border", "Кадрування-зум 1–3% або тонка рамка"),
-            ("grain", "Легке кіношне зерно"),
-            ("tempo", "Темп відео + аудіо (0.98×–1.03×)"),
+            ("color", "Колір: яскравість / контраст / насиченість / відтінок"),
+            ("zoom_border", "Мікрозум-кроп або тонка рамка"),
+            ("grain", "Плівкове зерно"),
+            ("tempo", "Темп відео + аудіо"),
             ("hflip", "Горизонтальне віддзеркалення (~50% варіацій)"),
         ]
         for n, (key, text) in enumerate(items):
             ctk.CTkCheckBox(tab, text=text, variable=self.bool_vars[key]).grid(
                 row=n // 2, column=n % 2, sticky="w", padx=12, pady=8)
 
-        ctk.CTkSwitch(tab, text="Випадкова комбінація: кожен увімкнений ефект спрацьовує з шансом ~65%",
-                      variable=self.bool_vars["randomize_set"]).grid(
-            row=3, column=0, columnspan=2, sticky="w", padx=12, pady=(14, 6))
+        rc = ctk.CTkFrame(tab, fg_color="transparent")
+        rc.grid(row=3, column=0, columnspan=2, sticky="w", padx=12, pady=(10, 4))
+        ctk.CTkSwitch(rc, text="Випадкова комбінація ефектів, шанс кожного:",
+                      variable=self.bool_vars["randomize_set"]).pack(side="left")
+        ctk.CTkSlider(rc, from_=0.1, to=1.0, number_of_steps=18, variable=self.chance_var, width=160,
+                      command=lambda v: self.chance_label.configure(text=f"{v:.0%}")).pack(side="left", padx=8)
+        self.chance_label = ctk.CTkLabel(rc, text=f"{self.chance_var.get():.0%}", width=44)
+        self.chance_label.pack(side="left")
 
         zb = ctk.CTkFrame(tab)
         zb.grid(row=4, column=0, columnspan=2, sticky="ew", padx=8, pady=(10, 4))
@@ -1723,6 +1791,32 @@ class App(ctk.CTk, *_DND_BASES):
                                        fg_color="#" + self.border_color[2:],
                                        text_color=self._contrast_text(self.border_color))
         self.color_btn.pack(side="left", padx=10)
+
+        rg = ctk.CTkFrame(tab)
+        rg.grid(row=5, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 4))
+        ctk.CTkLabel(rg, text="Діапазони (кожна варіація отримує випадкове значення в цих межах)",
+                     font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, columnspan=6, sticky="w",
+                                                           padx=10, pady=(8, 2))
+        rows = [
+            ("Контраст / насиченість, ±%", "color_min", "color_max"),
+            ("Яскравість, ±%", "bright_min", "bright_max"),
+            ("Мікрозум / кроп, %", "zoom_min", "zoom_max"),
+            ("Зерно (сила 1–25)", "grain_min", "grain_max"),
+            ("Темп, % (−10…+10)", "tempo_min", "tempo_max"),
+            ("Зсув відтінку, до ±°", None, "hue_max"),
+        ]
+        for i, (label, k_from, k_to) in enumerate(rows):
+            r, c = 1 + i // 2, (i % 2) * 3
+            ctk.CTkLabel(rg, text=label, anchor="w").grid(row=r, column=c, sticky="w", padx=(10, 6), pady=4)
+            box = ctk.CTkFrame(rg, fg_color="transparent")
+            box.grid(row=r, column=c + 1, sticky="w", padx=(0, 18))
+            if k_from:
+                ctk.CTkLabel(box, text="від").pack(side="left")
+                ctk.CTkEntry(box, textvariable=self.range_vars[k_from], width=52).pack(side="left", padx=4)
+                ctk.CTkLabel(box, text="до").pack(side="left")
+            ctk.CTkEntry(box, textvariable=self.range_vars[k_to], width=52).pack(side="left", padx=4)
+        ctk.CTkLabel(rg, text="Відтінок 0 = вимкнено. Невеликі значення дають помітно різні, але природні варіації.",
+                     text_color=HINT).grid(row=4, column=0, columnspan=6, sticky="w", padx=10, pady=(2, 8))
 
     def _tab_styles(self, tab):
         tab.grid_columnconfigure((0, 1, 2, 3), weight=1)
@@ -1805,6 +1899,7 @@ class App(ctk.CTk, *_DND_BASES):
                                                     padx=12, pady=8)
 
     def _tab_design(self, tab):
+        tab = self._scrollable(tab)
         tab.grid_columnconfigure(1, weight=1)
         r = 0
         ctk.CTkLabel(tab, text="Формат відео:").grid(row=r, column=0, sticky="w", padx=12, pady=8)
